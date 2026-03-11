@@ -1,0 +1,11 @@
+Received: from mail.suspicious-domain.ru (185.220.101.45)
+        by mx.gmail.com with SMTP id abc123
+From: "PayPal Security" <security@paypal.com>
+Reply-To: attacker@suspicious-domain.ru
+Return-Path: <attacker@suspicious-domain.ru>
+X-Originating-IP: 185.220.101.45
+Message-ID: <xyz789@suspicious-domain.ru>
+Subject: Urgent: Your account has been compromised
+Date: Tue, 10 Mar 2026 14:23:11 +0000
+MIME-Version: 1.0
+Content-Type: text/html
