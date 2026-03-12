@@ -1,0 +1,11 @@
+Received: from mail.paypal.com (185.234.219.32)
+        by mx.gmail.com with SMTP id abc123
+From: "PayPal Support" <support@paypal.com>
+Reply-To: support@paypal.com
+Return-Path: <bounce@phishing-paypal.com>
+X-Originating-IP: 185.234.219.32
+Message-ID: <xyz789@phishing-paypal.com>
+Subject: Your payment has been declined
+Date: Tue, 10 Mar 2026 14:23:11 +0000
+MIME-Version: 1.0
+Content-Type: text/html

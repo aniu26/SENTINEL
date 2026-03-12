@@ -1,0 +1,11 @@
+Received: from mail.amazon.com (193.32.162.157)
+        by mx.gmail.com with SMTP id abc123
+From: "Amazon" <orders@amazon.com>
+Reply-To: orders@amazon.com
+Return-Path: <orders@amazon.com>
+X-Originating-IP: 193.32.162.157
+Message-ID: <xyz789@amazon.com>
+Subject: Your order has been shipped
+Date: Tue, 10 Mar 2026 14:23:11 +0000
+MIME-Version: 1.0
+Content-Type: text/html

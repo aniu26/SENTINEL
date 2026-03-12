@@ -1,0 +1,13 @@
+Received: from mail.evil-domain.ru (185.220.101.45)
+        by relay.anonymous.net (45.33.32.156)
+Received: from relay.anonymous.net (45.33.32.156)
+        by mx.gmail.com (142.250.10.27) with SMTP
+From: "Microsoft" <security@microsoft.com>
+Reply-To: attacker@evil-domain.ru
+Return-Path: <attacker@evil-domain.ru>
+X-Originating-IP: 185.220.101.45
+Message-ID: <xyz789@evil-domain.ru>
+Subject: Urgent: Your Microsoft account
+Date: Tue, 10 Mar 2026 14:23:11 +0000
+MIME-Version: 1.0
+Content-Type: text/html

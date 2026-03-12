@@ -1,0 +1,11 @@
+Received: from mail.google.com (142.250.10.27)
+        by mx.outlook.com with SMTP id abc123
+From: "Google Security" <security@google.com>
+Reply-To: security@google.com
+Return-Path: <security@google.com>
+X-Originating-IP: 142.250.10.27
+Message-ID: <xyz789@google.com>
+Subject: Your Google account sign-in
+Date: Tue, 10 Mar 2026 14:23:11 +0000
+MIME-Version: 1.0
+Content-Type: text/html
