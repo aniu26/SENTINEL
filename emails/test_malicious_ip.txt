@@ -1,5 +1,12 @@
 Received: from mail.amazon.com (193.32.162.157)
         by mx.gmail.com with SMTP id abc123
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=amazon.com; s=nonexistent-selector;
+        h=from:reply-to:subject:date:message-id:mime-version:content-type;
+        bh=rL8mQ3zKpWvNxTdYsHjKuCbAeGfIoMnVpStQrUwXy=;
+        b=Jk2nP7qMzRvLwTdYsHjKuCbAeGfIoMnVpStQrUwXyZa
+         BcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJkLmNoPqRs
+         TuVwXyZaBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJk==
 From: "Amazon" <orders@amazon.com>
 Reply-To: orders@amazon.com
 Return-Path: <orders@amazon.com>

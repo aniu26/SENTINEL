@@ -1,5 +1,12 @@
 Received: from mail.google.com (142.250.10.27)
         by mx.outlook.com with SMTP id abc123
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=google.com; s=20230601;
+        h=from:reply-to:subject:date:message-id:mime-version:content-type;
+        bh=2jmj7l5rSw0yVb/vlWAYkK/YBwk0IlEOzFBFNFhK3s=;
+        b=Qs7vNpKrYmXtBwCzAeHfJiLoDgMuRsVqPnTkWxZyUb
+         CdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhIjKlMnOpQrSt
+         UvWxYzAbCdEfGhIjKlMnOpQrStUvWxYzAbCdEfGhIjKl==
 From: "Google Security" <security@google.com>
 Reply-To: security@google.com
 Return-Path: <security@google.com>

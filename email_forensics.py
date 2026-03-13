@@ -3,9 +3,10 @@
 # Description: Email header forensics with IP intelligence,
 #              AbuseIPDB integration, and batch processing
 
-import re 
+import re
 import requests
 import os
+import dns.resolver
 from dotenv import load_dotenv
 
  #load api key from .env file
@@ -151,7 +152,308 @@ def check_abuseipdb(ip):
     except requests.exceptions.ConnectionError:
         print(f"CONNECTION ERROR- AbuseIPDB connection error for {ip}.")
         return None
-    
+
+def check_spf(domain):
+    """Queries DNS TXT records to find and evaluate an SPF record for a domain.
+
+    SPF (Sender Policy Framework) is an email authentication standard defined
+    in RFC 7208. A domain publishes an SPF record as a DNS TXT record starting
+    with 'v=spf1'. It lists the mail servers authorised to send email on behalf
+    of that domain.
+
+    Why we check it:
+    Phishing emails frequently impersonate legitimate domains. If the sending
+    domain has no SPF record, or if the sending server is not listed in it,
+    that is a strong indicator the email is forged. Checking SPF is one of the
+    fastest ways to surface domain-level spoofing during header forensics.
+
+    Args:
+        domain: A domain name string, e.g. "google.com"
+
+    Returns:
+        A dictionary with:
+            spf_found  — bool: True if a v=spf1 TXT record exists
+            spf_record — str | None: the full SPF record string, or None
+            spf_pass   — bool: True if a valid SPF record was found
+            details    — str: human-readable explanation of the result
+    """
+    # --- Input validation ---
+    domain = domain.strip()
+
+    if not domain:
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": "Invalid input: domain name cannot be empty."
+        }
+
+    # DNS spec maximum is 253 characters
+    if len(domain) > 253:
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"Invalid input: domain exceeds 253-character DNS maximum ({len(domain)} chars)."
+        }
+
+    domain_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+'
+    if not re.match(domain_pattern, domain):
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"Invalid input: '{domain}' does not appear to be a valid domain name."
+        }
+
+    try:
+        answers = dns.resolver.resolve(domain, "TXT")
+        for record in answers:
+            # Each TXT record may be split across multiple strings; join them
+            full_record = "".join(
+                part.decode("utf-8") if isinstance(part, bytes) else part
+                for part in record.strings
+            )
+            # Strip control characters before processing or returning the record
+            full_record = re.sub(r'[\x00-\x1f\x7f]', '', full_record)
+
+            if full_record.startswith("v=spf1"):
+                return {
+                    "spf_found": True,
+                    "spf_record": full_record,
+                    "spf_pass": True,
+                    "details": f"SPF record found for {domain}: {full_record}"
+                }
+        # TXT records exist but none is an SPF record
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"No SPF record found for {domain}. Domain has TXT records but none start with 'v=spf1'."
+        }
+    except dns.exception.Timeout:
+        print(f"TIMEOUT- DNS query for {domain} timed out.")
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"DNS timeout while querying SPF record for {domain}."
+        }
+    except dns.resolver.NXDOMAIN:
+        print(f"NXDOMAIN- Domain {domain} does not exist in DNS.")
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"Domain {domain} does not exist (NXDOMAIN). Likely a spoofed or nonexistent sender domain."
+        }
+    except dns.resolver.NoAnswer:
+        print(f"NO ANSWER- No TXT records found for {domain}.")
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"No TXT records found for {domain}. Domain exists but publishes no SPF policy."
+        }
+    except dns.exception.DNSException as e:
+        print(f"DNS ERROR- Unexpected DNS error for {domain}: {e}")
+        return {
+            "spf_found": False,
+            "spf_record": None,
+            "spf_pass": False,
+            "details": f"Unexpected DNS error while querying SPF record for {domain}: {e}"
+        }
+
+def check_dkim(header_text, domain):
+    """Checks whether a DKIM signature is present and its public key exists in DNS.
+
+    DKIM (DomainKeys Identified Mail) is an email authentication standard defined
+    in RFC 6376. The sending mail server signs outgoing messages with a private key
+    and publishes the matching public key in DNS as a TXT record. Receiving servers
+    can then verify the signature to confirm the message was not tampered with and
+    genuinely originates from the claimed domain.
+
+    How it works in DNS:
+    The public key is published at a specific subdomain constructed from two values
+    embedded in the DKIM-Signature header:
+        - Selector (s=): a label chosen by the domain owner, e.g. "s20221208"
+        - Signing domain (d=): the domain that applied the signature, e.g. "gmail.com"
+    The resulting DNS query name is: {selector}._domainkey.{domain}
+    For example:  s20221208._domainkey.gmail.com
+
+    Why we check it:
+    Phishing emails cannot produce a valid DKIM signature for a domain they do not
+    control, because they do not have the private key. If the DKIM-Signature header
+    is missing, the selector does not resolve in DNS, or no public key (p=) is
+    present, that is a strong indicator the email is forged or the signature has
+    been revoked. Checking DKIM alongside SPF gives a much more complete picture
+    of whether an email is authenticated.
+
+    Args:
+        header_text: The full raw email header string.
+        domain:      The sender domain string, e.g. "gmail.com".
+
+    Returns:
+        A dictionary with:
+            dkim_header_found — bool: True if a DKIM-Signature header was found
+            dkim_selector     — str | None: the selector value (s=) from the header
+            dkim_domain       — str | None: the signing domain (d=) from the header
+            dkim_key_found    — bool: True if a public key record exists in DNS
+            details           — str: human-readable explanation of the result
+    """
+    # --- Input validation: domain ---
+    domain = domain.strip()
+
+    if not domain:
+        return {
+            "dkim_header_found": False,
+            "dkim_selector": None,
+            "dkim_domain": None,
+            "dkim_key_found": False,
+            "details": "Invalid input: domain name cannot be empty."
+        }
+
+    # DNS spec maximum is 253 characters
+    if len(domain) > 253:
+        return {
+            "dkim_header_found": False,
+            "dkim_selector": None,
+            "dkim_domain": None,
+            "dkim_key_found": False,
+            "details": f"Invalid input: domain exceeds 253-character DNS maximum ({len(domain)} chars)."
+        }
+
+    domain_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z]{2,})+'
+    if not re.match(domain_pattern, domain):
+        return {
+            "dkim_header_found": False,
+            "dkim_selector": None,
+            "dkim_domain": None,
+            "dkim_key_found": False,
+            "details": f"Invalid input: '{domain}' does not appear to be a valid domain name."
+        }
+
+    # --- Extract DKIM-Signature header (handles folded multi-line values) ---
+    dkim_match = re.search(r'(?im)^DKIM-Signature:\s*(.+(?:\n[ \t]+.+)*)', header_text)
+
+    if not dkim_match:
+        return {
+            "dkim_header_found": False,
+            "dkim_selector": None,
+            "dkim_domain": None,
+            "dkim_key_found": False,
+            "details": f"No DKIM-Signature header found in email. Domain {domain} may not sign outgoing mail."
+        }
+
+    dkim_value = dkim_match.group(1)
+
+    # --- Parse selector (s=) and signing domain (d=) from DKIM-Signature ---
+    selector_match = re.search(r'\bs=([^;\s]+)', dkim_value)
+    dkim_domain_match = re.search(r'\bd=([^;\s]+)', dkim_value)
+
+    selector = selector_match.group(1).strip() if selector_match else None
+    dkim_domain = dkim_domain_match.group(1).strip() if dkim_domain_match else None
+
+    # If either value is missing we cannot form a valid DNS query — return early
+    if not selector or not dkim_domain:
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": "DKIM-Signature header found but selector (s=) or domain (d=) could not be parsed."
+        }
+
+    # --- Validate selector before using it in a DNS query ---
+    # RFC 1035: each label must be 1-63 chars, alphanumeric and hyphens only
+    selector_pattern = r'^[a-zA-Z0-9][a-zA-Z0-9\-]{0,62}$'
+    if not re.match(selector_pattern, selector):
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": None,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": (
+                f"DKIM selector failed validation — contains invalid characters or "
+                f"exceeds the 63-character RFC 1035 label limit."
+            )
+        }
+
+    # Use the validated domain parameter (not the raw d= value) to construct
+    # the query name — treats all header-extracted data as untrusted
+    query_name = f"{selector}._domainkey.{domain}"
+
+    try:
+        answers = dns.resolver.resolve(query_name, "TXT")
+        for record in answers:
+            # Each TXT record may be split across multiple strings; join them
+            full_record = "".join(
+                part.decode("utf-8") if isinstance(part, bytes) else part
+                for part in record.strings
+            )
+            # Strip control characters from DNS response before any comparison
+            full_record = re.sub(r'[\x00-\x1f\x7f]', '', full_record)
+
+            # DKIM public key records always contain a p= tag
+            if "p=" in full_record:
+                return {
+                    "dkim_header_found": True,
+                    "dkim_selector": selector,
+                    "dkim_domain": dkim_domain,
+                    "dkim_key_found": True,
+                    "details": (
+                        f"DKIM public key found at {query_name}. "
+                        f"Selector '{selector}' is valid and active."
+                    )
+                }
+        # TXT records exist at the query name but none contain a DKIM public key
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": f"TXT records found at {query_name} but none contain a DKIM public key (p=)."
+        }
+    except dns.exception.Timeout:
+        print(f"TIMEOUT- DNS query for {query_name} timed out.")
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": f"DNS timeout while querying DKIM key at {query_name}."
+        }
+    except dns.resolver.NXDOMAIN:
+        print(f"NXDOMAIN- DKIM record {query_name} does not exist in DNS.")
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": (
+                f"No DKIM record found at {query_name} (NXDOMAIN). "
+                f"Selector may be revoked or domain does not publish DKIM keys."
+            )
+        }
+    except dns.resolver.NoAnswer:
+        print(f"NO ANSWER- No TXT records found at {query_name}.")
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": f"No TXT records found at {query_name}. DKIM public key is not published for this selector."
+        }
+    except dns.exception.DNSException as e:
+        print(f"DNS ERROR- Unexpected DNS error querying {query_name}: {type(e).__name__}")
+        return {
+            "dkim_header_found": True,
+            "dkim_selector": selector,
+            "dkim_domain": dkim_domain,
+            "dkim_key_found": False,
+            "details": f"Unexpected DNS error while querying DKIM key at {query_name}: {type(e).__name__}"
+        }
+
 def analyze_ip_intelligence(ip):
     """
     Combines geolocation and AbuseIPDB data
@@ -267,6 +569,10 @@ def generate_report(filename):
     print(f" Originating IP: {originating_ip}")
     print(f" Message-ID: {message_id}")
 
+    # Extract sender domain for SPF and DKIM checks
+    domain_match = re.search(r'@([\w.-]+)', from_field)
+    sender_domain = domain_match.group(1) if domain_match else None
+
     # Extract and print all IP addresses
     print("\n🌐 IP INTELLIGENCE ANALYSIS")
     print("-" * 40)
@@ -287,7 +593,39 @@ def generate_report(filename):
     else:
         print(" No spoofing indicators detected.")  
 
-    if flags or ip_risk_detected:
+    # Run SPF and DKIM authentication checks
+    print("\n EMAIL AUTHENTICATION")
+    print("-" * 40)
+
+    if sender_domain:
+        spf_result = check_spf(sender_domain)
+        spf_status = "✅ PASS" if spf_result["spf_pass"] else "❌ FAIL"
+        spf_record_display = spf_result["spf_record"] if spf_result["spf_record"] else "not found"
+        print(f" 📧 SPF Check:  {spf_status}")
+        print(f"    Record:  {spf_record_display}")
+        print(f"    Details: {spf_result['details']}")
+
+        dkim_result = check_dkim(header, sender_domain)
+        dkim_status = "✅ PASS" if dkim_result["dkim_key_found"] else "❌ FAIL"
+        dkim_selector_display = dkim_result["dkim_selector"] if dkim_result["dkim_selector"] else "not found"
+        print(f"\n 🔏 DKIM Check: {dkim_status}")
+        print(f"    Selector: {dkim_selector_display}")
+        print(f"    Details:  {dkim_result['details']}")
+    else:
+        print(" ⚠️  Could not extract sender domain from From field — skipping SPF/DKIM checks.")
+        spf_result = {"spf_pass": False}
+        dkim_result = {"dkim_key_found": False}
+
+    # Calculate authentication failure — only a risk signal when both fail together
+    spf_fail = not spf_result["spf_pass"]
+    dkim_fail = not dkim_result["dkim_key_found"]
+    auth_fail = spf_fail and dkim_fail
+
+    if auth_fail:
+        print("\n 🚨 AUTHENTICATION FAILURE: Both SPF and DKIM checks failed.")
+        print("    This is a strong indicator the sender domain is forged.")
+
+    if flags or ip_risk_detected or auth_fail:
         print("🚨 HIGH RISK — This email shows strong indicators of phishing")
         print("   Recommended actions:")
         print("   → Block sender domain immediately")
@@ -303,7 +641,7 @@ def generate_report(filename):
     print("✅ Analysis performed entirely on-device")
     print("✅ Only IP addresses sent to external APIs")
     print("✅ No email content shared with third parties")
-    is_high_risk = bool(flags) or ip_risk_detected
+    is_high_risk = bool(flags) or ip_risk_detected or auth_fail
     return is_high_risk
 def process_folder(folder_path):
     """

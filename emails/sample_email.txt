@@ -1,5 +1,12 @@
 Received: from mail.suspicious-domain.ru (185.220.101.45)
         by mx.gmail.com with SMTP id abc123
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=paypal.com; s=fake-selector;
+        h=from:reply-to:subject:date:message-id:mime-version:content-type;
+        bh=47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=;
+        b=Xk9mP2qLzRvNwTdYsHjKuCbAeGfIoMnVpStQrUwXyZa
+         BcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJkLmNoPqRs
+         TuVwXyZaBcDeFgHiJkLmNoPqRsTuVwXyZaBcDeFgHiJk==
 From: "PayPal Security" <security@paypal.com>
 Reply-To: attacker@suspicious-domain.ru
 Return-Path: <attacker@suspicious-domain.ru>
