@@ -458,12 +458,17 @@ def analyze_ip_intelligence(ip):
     """
     Combines geolocation and AbuseIPDB data
     to produce a complete IP intelligence profile.
-    
+
     Why combine both:
     Neither API alone tells the full story.
     Geolocation tells us WHERE, AbuseIPDB tells us
     WHO has seen this IP doing bad things.
     Together they give us a complete picture.
+
+    Returns:
+        A dictionary with:
+            is_risky    — bool: True if IP shows high abuse score or anonymisation
+            abuse_score — int:  raw AbuseIPDB confidence score (0-100), or 0 if unavailable
     """
     print(f"\n  📍 Analyzing: {ip}")
     print("  " + "-" * 45)
@@ -522,11 +527,15 @@ def analyze_ip_intelligence(ip):
     else:
         print(f"  ❌ AbuseIPDB data unavailable")
     
-    # Return combined risk assessment
-    tor_or_vpn = geo and (geo["is_tor"] or geo["is_vpn"] or geo["is_proxy"])
-    high_abuse = abuse and abuse["abuse_score"] >= 80
-    
-    return tor_or_vpn or high_abuse
+    # Return combined risk assessment and raw score for callers
+    tor_or_vpn  = geo and (geo["is_tor"] or geo["is_vpn"] or geo["is_proxy"])
+    high_abuse  = abuse and abuse["abuse_score"] >= 80
+    abuse_score = abuse["abuse_score"] if abuse else 0
+
+    return {
+        "is_risky":    bool(tor_or_vpn or high_abuse),
+        "abuse_score": abuse_score
+    }
 
 def get_flag(country_code):
     """
@@ -789,6 +798,183 @@ def map_to_mitre(findings):
 
     return techniques
 
+def calculate_confidence(findings):
+    """Calculates a numeric confidence score for phishing classification.
+
+    What confidence scoring is:
+    Boolean indicators alone — spoofing yes/no, SPF pass/fail — produce a
+    binary verdict that loses nuance. A confidence score aggregates multiple
+    weighted signals into a single 0-100 integer that communicates how
+    strongly the available evidence supports a phishing classification.
+    Higher scores indicate more corroborating evidence; lower scores indicate
+    either a clean email or insufficient signals to make a determination.
+
+    Why numeric scores matter for SOC analysts:
+    SOC teams process high volumes of alerts. A numeric score enables triage
+    prioritisation — a score of 90 warrants immediate escalation while a 35
+    may be queued for routine review. Scores also integrate naturally into
+    SIEM platforms and ticketing systems (e.g. Splunk, ServiceNow) where
+    thresholds trigger automated playbooks. They provide an audit trail:
+    the score_breakdown list gives analysts a line-by-line explanation they
+    can include in incident reports or dispute if an alert was wrong.
+
+    How the weighting model was designed:
+    Weights reflect the relative reliability of each signal as a phishing
+    indicator, informed by published threat intelligence research:
+        - Domain spoofing (+25) is the single strongest indicator — it is
+          the defining characteristic of impersonation attacks.
+        - Malicious IP (+20) confirms the sending infrastructure is known-bad
+          according to community threat intelligence (AbuseIPDB).
+        - Tor/VPN/Proxy (+15) indicates deliberate anonymisation of origin.
+        - Authentication failures (+10 each) are common in phishing but also
+          occur on misconfigured legitimate mail, so they carry less weight.
+        - Urgency language (+10) is a soft signal — keyword matching cannot
+          confirm intent and generates false positives on legitimate alerts.
+        - MITRE technique count (+5 each, cap +15) rewards corroboration
+          across multiple tactic categories rather than one repeated signal.
+    Negative adjustments reward clean signals to prevent over-classification
+    of legitimate email with one suspicious characteristic.
+
+    Limitations of the current model:
+        - The weights are heuristic, not trained on labelled data. A machine
+          learning model calibrated on a labelled email corpus would produce
+          more accurate probability estimates.
+        - urgency_detected is currently subject-line only. Body analysis
+          (planned for a future .eml parser) will improve recall significantly.
+        - abuse_score is used as a binary (0 vs non-zero) rather than a
+          continuous variable. A graduated contribution based on score bands
+          would better reflect AbuseIPDB's confidence levels.
+        - suspicious_tld is an optional key not yet populated by the main
+          report pipeline. It is ready to activate when check_spoofing()
+          is updated to return TLD findings in structured form.
+        - The model does not account for the combination of signals — two
+          independent HIGH-confidence indicators together are stronger evidence
+          than their individual scores suggest.
+
+    Args:
+        findings: A dictionary of observed indicators. All keys are optional;
+                  missing keys receive safe defaults. Recognised keys:
+                      spoofing_detected — bool   (default False)
+                      malicious_ip      — bool   (default False)
+                      tor_vpn_detected  — bool   (default False)
+                      spf_pass          — bool   (default True)
+                      dkim_pass         — bool   (default True)
+                      urgency_detected  — bool   (default False)
+                      urgency_score     — int    (default 0)
+                      abuse_score       — int    (default 0, range 0-100)
+                      techniques_count  — int    (default 0)
+                      suspicious_tld    — bool   (default False)
+
+    Returns:
+        A dictionary with:
+            confidence_score — int 0-100: the aggregated weighted score
+            risk_level       — str: "LOW" (0-30), "MEDIUM" (31-60), "HIGH" (61-100)
+            score_breakdown  — list of str: one entry per factor explaining its contribution
+            details          — str: one-line human-readable summary
+    """
+    # --- Safe extraction with typed defaults ---
+    spoofing_detected = findings.get("spoofing_detected", False)
+    malicious_ip      = findings.get("malicious_ip",      False)
+    tor_vpn_detected  = findings.get("tor_vpn_detected",  False)
+    spf_pass          = findings.get("spf_pass",          True)
+    dkim_pass         = findings.get("dkim_pass",         True)
+    urgency_detected  = findings.get("urgency_detected",  False)
+    urgency_score     = findings.get("urgency_score",     0)
+    abuse_score       = findings.get("abuse_score",       0)
+    techniques_count  = findings.get("techniques_count",  0)
+    suspicious_tld    = findings.get("suspicious_tld",    False)
+
+    # Coerce numeric inputs — unexpected types default to 0
+    if not isinstance(abuse_score, int):
+        abuse_score = 0
+    if not isinstance(techniques_count, int):
+        techniques_count = 0
+    if not isinstance(urgency_score, int):
+        urgency_score = 0
+
+    # Clamp to valid ranges
+    abuse_score      = max(0, min(100, abuse_score))
+    techniques_count = max(0, techniques_count)
+
+    score     = 0
+    breakdown = []
+
+    # --- Risk additions ---
+    if spoofing_detected:
+        score += 25
+        breakdown.append("+25: Domain spoofing detected (From/Reply-To/Return-Path mismatch)")
+
+    if malicious_ip:
+        score += 20
+        breakdown.append("+20: Originating IP flagged as malicious by AbuseIPDB")
+
+    if tor_vpn_detected:
+        score += 15
+        breakdown.append("+15: Tor/VPN/Proxy detected on originating IP")
+
+    if not spf_pass:
+        score += 10
+        breakdown.append("+10: SPF check failed — sender not authorised by domain policy")
+
+    if not dkim_pass:
+        score += 10
+        breakdown.append("+10: DKIM check failed — no valid public key found in DNS")
+
+    if urgency_detected:
+        score += 10
+        breakdown.append(f"+10: Urgency/manipulation language detected ({urgency_score} pattern(s) matched)")
+
+    if suspicious_tld:
+        score += 10
+        breakdown.append("+10: Reply-To or Return-Path domain uses a suspicious TLD")
+
+    technique_contribution = min(techniques_count * 5, 15)
+    if technique_contribution > 0:
+        score += technique_contribution
+        breakdown.append(
+            f"+{technique_contribution}: {techniques_count} MITRE ATT&CK technique(s) mapped (capped at +15)"
+        )
+
+    # --- Risk reductions ---
+    if abuse_score == 0:
+        score -= 10
+        breakdown.append("-10: AbuseIPDB abuse score is 0 — IP has no known community reports")
+
+    if spf_pass:
+        score -= 5
+        breakdown.append("-5: SPF check passed — sender is authorised by domain policy")
+
+    if dkim_pass:
+        score -= 5
+        breakdown.append("-5: DKIM check passed — valid public key found in DNS")
+
+    if not spoofing_detected:
+        score -= 5
+        breakdown.append("-5: No domain spoofing detected")
+
+    # Cap final score within 0-100
+    score = max(0, min(100, score))
+
+    # Determine risk level
+    if score <= 30:
+        risk_level = "LOW"
+    elif score <= 60:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "HIGH"
+
+    details = (
+        f"Confidence score {score}/100 — {risk_level} risk "
+        f"({len(breakdown)} factor(s) evaluated)."
+    )
+
+    return {
+        "confidence_score": score,
+        "risk_level":       risk_level,
+        "score_breakdown":  breakdown,
+        "details":          details
+    }
+
 def generate_report(filename):
     """Generates a forensic report based on the email header analysis."""
     print("=" * 60)
@@ -828,10 +1014,12 @@ def generate_report(filename):
     ips = extract_ip_addresses(header)
 
     ip_risk_detected = False
+    max_abuse_score  = 0
     for ip in ips:
-        is_risky = analyze_ip_intelligence(ip)
-        if is_risky:
-            ip_risk_detected = True  
+        result = analyze_ip_intelligence(ip)
+        if result["is_risky"]:
+            ip_risk_detected = True
+        max_abuse_score = max(max_abuse_score, result["abuse_score"])
     # Check for spoofing indicators
     print("\n SPOOFING ANALYSIS")   
     print("-" * 40)
@@ -840,7 +1028,10 @@ def generate_report(filename):
         for flag in flags:
             print(flag)
     else:
-        print(" No spoofing indicators detected.")  
+        print(" No spoofing indicators detected.")
+
+    # Derive TLD flag from spoofing results — check_spoofing() appends "uses a TLD" when found
+    tld_detected = any("uses a TLD" in flag for flag in flags)
 
     # Run SPF and DKIM authentication checks
     print("\n EMAIL AUTHENTICATION")
@@ -913,13 +1104,42 @@ def generate_report(filename):
     else:
         print("✅ No ATT&CK techniques mapped")
 
-    if flags or ip_risk_detected or auth_fail:
+    # Build confidence findings and calculate score
+    confidence_findings = {
+        "spoofing_detected": bool(flags),
+        "malicious_ip":      ip_risk_detected,
+        "tor_vpn_detected":  ip_risk_detected,
+        "spf_pass":          spf_result.get("spf_pass", True),
+        "dkim_pass":         dkim_result.get("dkim_key_found", True),
+        "urgency_detected":  urgency_result["urgency_detected"],
+        "urgency_score":     urgency_result["urgency_score"],
+        "abuse_score":       max_abuse_score,
+        "techniques_count":  len(techniques),
+        "suspicious_tld":    tld_detected
+    }
+    confidence = calculate_confidence(confidence_findings)
+
+    print("\n📊 CONFIDENCE SCORE")
+    print("-" * 40)
+    print(f" Score: {confidence['confidence_score']}/100 — {confidence['risk_level']} RISK")
+    print(f"\n Score Breakdown:")
+    for entry in confidence["score_breakdown"]:
+        print(f"   {entry}")
+    print(f"\n Details: {confidence['details']}")
+
+    if confidence["risk_level"] == "HIGH":
         print("🚨 HIGH RISK — This email shows strong indicators of phishing")
         print("   Recommended actions:")
         print("   → Block sender domain immediately")
         print("   → Report malicious IPs to AbuseIPDB")
         print("   → Alert security team")
         print("   → Preserve email headers as evidence")
+    elif confidence["risk_level"] == "MEDIUM":
+        print("⚠️  MEDIUM RISK — This email shows some suspicious indicators")
+        print("   Recommended actions:")
+        print("   → Verify sender identity through a separate channel")
+        print("   → Do not click links or open attachments")
+        print("   → Flag for manual review by security team")
     else:
         print("✅ LOW RISK — No obvious phishing indicators found")
 
@@ -929,7 +1149,7 @@ def generate_report(filename):
     print("✅ Analysis performed entirely on-device")
     print("✅ Only IP addresses sent to external APIs")
     print("✅ No email content shared with third parties")
-    is_high_risk = bool(flags) or ip_risk_detected or auth_fail
+    is_high_risk = confidence["risk_level"] == "HIGH"
     return is_high_risk
 def process_folder(folder_path):
     """
