@@ -38,8 +38,8 @@ def extract_field(header, field_name):
     """Extracts the value of a specified field from the email header.
     Returns the field value as a string, or None if not found.
     """
-    pattern = rf"{field_name}:\s*(.+)"
-    match = re.search(pattern, header, re.IGNORECASE)
+    pattern = rf"^{field_name}:\s*(.+)"
+    match = re.search(pattern, header, re.IGNORECASE | re.MULTILINE)
     if match:
         return match.group(1).strip()
     return "not found"
@@ -540,7 +540,255 @@ def get_flag(country_code):
         return "🏳️"
     return "".join(
         chr(ord(c) + 127397) for c in country_code.upper()
-    )    
+    )
+
+def detect_urgency(subject, body):
+    """Scans email subject and body for urgency and manipulation language.
+
+    What urgency detection is:
+    Phishing emails rely heavily on psychological pressure to override a
+    victim's critical thinking. Attackers craft messages designed to make
+    recipients act immediately without pausing to verify legitimacy. This
+    function identifies four categories of manipulation language commonly
+    used in phishing campaigns by searching for known trigger phrases.
+
+    Why attackers use urgency language:
+    Social engineering works by exploiting cognitive biases. Urgency bypasses
+    rational decision-making — when a person believes their account will be
+    deleted in 24 hours or that they have won a prize, they are less likely
+    to scrutinise the sender address, links, or authentication signals.
+    Urgency language is documented in academic literature on phishing and
+    consistently appears in real-world campaigns targeting banking, cloud
+    services, and corporate credentials.
+
+    Connection to MITRE ATT&CK T1566 (Phishing):
+    MITRE T1566 covers phishing as an Initial Access technique. Sub-technique
+    T1566.001 (Spearphishing Attachment) and T1566.002 (Spearphishing Link)
+    describe the delivery mechanism, but the social engineering element —
+    convincing the recipient to act — is the enabler. Urgency language is
+    a primary component of that social engineering layer. A positive result
+    from this function directly supports mapping to T1566 with MEDIUM confidence,
+    since keyword matching alone cannot confirm intent.
+
+    Current limitation — subject-only analysis when body is unavailable:
+    SENTINEL currently processes raw email header files (.txt) that do not
+    include the message body. When body is None or empty, this function
+    analyses the subject line only. Subject-line urgency is still a meaningful
+    signal — attackers frequently embed pressure language there — but the
+    detection coverage is reduced. A body-absent result is flagged explicitly
+    in the returned details string and the body_analyzed key.
+
+    Future improvement — full .eml support:
+    In a future version, SENTINEL will parse full RFC 5322 .eml files using
+    Python's email.parser module. This will make the message body, HTML
+    content, and MIME parts available for analysis, significantly increasing
+    urgency detection accuracy and reducing false negatives on emails where
+    urgency language appears only in the body.
+
+    Args:
+        subject: The email subject line string.
+        body:    The email body text string, or None if unavailable.
+
+    Returns:
+        A dictionary with:
+            urgency_detected     — bool: True if any urgency patterns matched
+            urgency_score        — int: total number of individual patterns matched
+            categories_triggered — list of str: category names that had at least one match
+            matched_patterns     — list of str: exact phrases that matched
+            details              — str: human-readable explanation of the result
+            body_analyzed        — bool: True if body text was available and scanned
+    """
+    # --- Input sanitisation ---
+    # Coerce None to empty string before any string operations
+    subject = subject if isinstance(subject, str) else ""
+    body    = body    if isinstance(body,    str) else ""
+
+    # Strip control characters from both inputs
+    subject = re.sub(r'[\x00-\x1f\x7f]', '', subject)
+    body    = re.sub(r'[\x00-\x1f\x7f]', '', body)
+
+    # Truncate subject to RFC 5321 maximum of 998 characters
+    subject = subject[:998]
+
+    body_analyzed = bool(body)
+
+    # Build the text to scan — subject always included, body when available
+    scan_text = subject + (" " + body if body else "")
+
+    # Lowercase once for all case-insensitive comparisons
+    scan_lower = scan_text.lower()
+
+    # --- Pattern categories ---
+    patterns = {
+        "ACCOUNT_THREAT": [
+            "suspended", "disabled", "locked", "blocked",
+            "deactivated", "terminated", "unauthorized access",
+            "suspicious activity", "unusual activity",
+            "security alert", "account compromised",
+            "breach detected"
+        ],
+        "ACTION_DEMAND": [
+            "immediate action", "act now", "urgent",
+            "verify now", "confirm immediately",
+            "action required", "update required",
+            "verify your account", "confirm your identity"
+        ],
+        "TIME_PRESSURE": [
+            "within 24 hours", "expires soon",
+            "limited time", "final notice",
+            "deadline", "will be deleted",
+            "hours remaining", "expires in"
+        ],
+        "REWARD_LURE": [
+            "you have won", "congratulations",
+            "selected winner", "claim your prize",
+            "free gift", "exclusive offer"
+        ]
+    }
+
+    # --- Matching ---
+    categories_triggered = []
+    matched_patterns     = []
+
+    for category, phrases in patterns.items():
+        category_matched = False
+        for phrase in phrases:
+            if phrase in scan_lower:
+                matched_patterns.append(phrase)
+                if not category_matched:
+                    categories_triggered.append(category)
+                    category_matched = True
+
+    urgency_score    = len(matched_patterns)
+    urgency_detected = urgency_score > 0
+
+    # --- Build details string ---
+    if urgency_detected:
+        category_list = ", ".join(categories_triggered)
+        details = (
+            f"Urgency language detected — {urgency_score} pattern(s) matched "
+            f"across {len(categories_triggered)} category(s): {category_list}."
+        )
+    else:
+        details = "No urgency or manipulation language detected."
+
+    if not body_analyzed:
+        details += " Note: email body was not available — subject line analysed only."
+
+    return {
+        "urgency_detected":     urgency_detected,
+        "urgency_score":        urgency_score,
+        "categories_triggered": categories_triggered,
+        "matched_patterns":     matched_patterns,
+        "details":              details,
+        "body_analyzed":        body_analyzed
+    }
+
+def map_to_mitre(findings):
+    """Maps observed email threat indicators to MITRE ATT&CK techniques.
+
+    What is MITRE ATT&CK:
+    MITRE ATT&CK (Adversarial Tactics, Techniques, and Common Knowledge) is a
+    globally recognised knowledge base of adversary behaviours based on
+    real-world observations. It organises attacks into Tactics (the goal the
+    attacker is trying to achieve) and Techniques (the specific method used to
+    achieve that goal). Technique IDs like T1566.002 give security teams a
+    common, vendor-neutral language to describe threats.
+
+    Why mapping to ATT&CK matters for SOC teams:
+    Raw forensic findings (e.g. "SPF failed") are useful for triage but do not
+    communicate intent or severity to a SOC analyst or incident responder.
+    Mapping findings to ATT&CK techniques allows teams to:
+        - Correlate this email with other alerts using the same technique ID
+        - Prioritise response based on tactic severity
+        - Feed findings directly into SIEMs and threat intel platforms that
+          index by ATT&CK ID (e.g. Splunk ES, Microsoft Sentinel, Elastic SIEM)
+        - Write detection rules tied to documented adversary behaviour
+        - Produce structured threat reports that are meaningful across teams
+
+    Tactics used in these mappings:
+        Initial Access      — The adversary is attempting to get into the network.
+                              Phishing is the most common initial access vector.
+        Defense Evasion     — The adversary is trying to avoid being detected.
+                              Forging sender identity hides the true origin.
+        Command and Control — The adversary is communicating with compromised systems.
+                              Malicious IPs and anonymisation tools indicate C2 infra.
+
+    Args:
+        findings: A dictionary of observed indicators with these boolean keys:
+                      spoofing_detected — From/Reply-To/Return-Path domain mismatch
+                      tor_vpn_detected  — Tor exit node, VPN, or proxy on sending IP
+                      malicious_ip      — IP has high AbuseIPDB abuse score
+                      spf_pass          — SPF DNS record check passed
+                      dkim_pass         — DKIM public key found in DNS
+                      urgency_detected  — Urgency/pressure language in subject or body
+
+    Returns:
+        A list of dictionaries, one per mapped technique, each containing:
+            technique_id   — ATT&CK technique ID, e.g. "T1566.002"
+            technique_name — Human-readable technique name
+            tactic         — The ATT&CK tactic this technique falls under
+            confidence     — "HIGH", "MEDIUM", or "LOW"
+            reason         — Why this technique was mapped based on observed evidence
+        Returns an empty list if no techniques were mapped.
+    """
+    techniques = []
+
+    # Use .get() throughout — never crash on missing or unexpected keys
+    spoofing_detected = findings.get("spoofing_detected", False)
+    tor_vpn_detected  = findings.get("tor_vpn_detected", False)
+    malicious_ip      = findings.get("malicious_ip", False)
+    spf_pass          = findings.get("spf_pass", True)
+    dkim_pass         = findings.get("dkim_pass", True)
+    urgency_detected  = findings.get("urgency_detected", False)
+
+    if spoofing_detected:
+        techniques.append({
+            "technique_id":   "T1566.002",
+            "technique_name": "Spearphishing Link",
+            "tactic":         "Initial Access",
+            "confidence":     "HIGH",
+            "reason":         "Domain mismatch detected between From, Reply-To, and Return-Path fields."
+        })
+
+    if tor_vpn_detected:
+        techniques.append({
+            "technique_id":   "T1090.003",
+            "technique_name": "Multi-hop Proxy",
+            "tactic":         "Command and Control",
+            "confidence":     "HIGH",
+            "reason":         "Tor/VPN/Proxy detected on originating IP address."
+        })
+
+    if not spf_pass and not dkim_pass:
+        techniques.append({
+            "technique_id":   "T1036.005",
+            "technique_name": "Match Legitimate Name or Location",
+            "tactic":         "Defense Evasion",
+            "confidence":     "MEDIUM",
+            "reason":         "Both SPF and DKIM authentication failed, indicating sender identity is forged."
+        })
+
+    if malicious_ip:
+        techniques.append({
+            "technique_id":   "T1071.003",
+            "technique_name": "Mail Protocols",
+            "tactic":         "Command and Control",
+            "confidence":     "HIGH",
+            "reason":         "Originating IP has high abuse score indicating known malicious infrastructure."
+        })
+
+    if urgency_detected:
+        techniques.append({
+            "technique_id":   "T1566",
+            "technique_name": "Phishing",
+            "tactic":         "Initial Access",
+            "confidence":     "MEDIUM",
+            "reason":         "Urgency language detected indicating social engineering attempt."
+        })
+
+    return techniques
+
 def generate_report(filename):
     """Generates a forensic report based on the email header analysis."""
     print("=" * 60)
@@ -556,6 +804,7 @@ def generate_report(filename):
     reply_to = extract_field(header, "Reply-To")    
     return_path = extract_field(header, "Return-Path")
     subject = extract_field(header, "Subject")
+    urgency_result = detect_urgency(subject, None)
     originating_ip = extract_field(header, "X-Originating-IP")
     message_id = extract_field(header, "Message-ID")
 
@@ -624,6 +873,45 @@ def generate_report(filename):
     if auth_fail:
         print("\n 🚨 AUTHENTICATION FAILURE: Both SPF and DKIM checks failed.")
         print("    This is a strong indicator the sender domain is forged.")
+
+    # Urgency and social engineering language analysis
+    print("\n🚨 URGENCY ANALYSIS")
+    print("-" * 40)
+    if urgency_result["urgency_detected"]:
+        categories = ", ".join(urgency_result["categories_triggered"])
+        patterns   = ", ".join(urgency_result["matched_patterns"])
+        print(f" ⚠️  Urgency language detected")
+        print(f"    Score:      {urgency_result['urgency_score']} pattern(s) matched")
+        print(f"    Categories: {categories}")
+        print(f"    Patterns:   {patterns}")
+        print(f"    Details:    {urgency_result['details']}")
+        if not urgency_result["body_analyzed"]:
+            print(f" ℹ️  Body not available — subject analyzed only")
+    else:
+        print(f" ✅ No urgency language detected")
+        print(f"    Details: {urgency_result['details']}")
+
+    # Build findings and map to MITRE ATT&CK techniques
+    findings = {
+        "spoofing_detected": bool(flags),
+        "tor_vpn_detected":  ip_risk_detected,
+        "malicious_ip":      ip_risk_detected,
+        "spf_pass":          spf_result.get("spf_pass", True),
+        "dkim_pass":         dkim_result.get("dkim_key_found", True),
+        "urgency_detected":  urgency_result["urgency_detected"]
+    }
+    techniques = map_to_mitre(findings)
+
+    print("\n🎯 MITRE ATT&CK MAPPING")
+    print("-" * 40)
+    if techniques:
+        for technique in techniques:
+            print(f"\n [TACTIC] {technique['tactic']}")
+            print(f" → {technique['technique_id']} — {technique['technique_name']}")
+            print(f"   Confidence: {technique['confidence']}")
+            print(f"   Reason: {technique['reason']}")
+    else:
+        print("✅ No ATT&CK techniques mapped")
 
     if flags or ip_risk_detected or auth_fail:
         print("🚨 HIGH RISK — This email shows strong indicators of phishing")
