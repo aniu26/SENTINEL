@@ -24,16 +24,96 @@ load_dotenv(dotenv_path=env_path)
 
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY")
  
+def validate_file_path(filename):
+    """Validates a filename to prevent path traversal attacks.
+
+    Path traversal (CWE-22) allows attackers to escape an intended directory
+    by embedding sequences like '../' in a filename (e.g. '../../etc/passwd').
+    This function defends against that by:
+      1. Resolving the absolute real path (following all symlinks and '..' segments)
+      2. Confirming the resolved path is inside the allowed BASE_DIR
+      3. Allowing only .txt and .eml file extensions
+      4. Confirming the file actually exists before returning the path
+
+    Only files inside <script_dir>/emails/ with a .txt or .eml extension are
+    considered valid. Any attempt to escape that directory raises ValueError
+    before the filesystem is ever touched for reading.
+
+    Args:
+        filename: A filename or relative path string provided by the caller.
+
+    Returns:
+        The resolved, safe absolute path string if all checks pass.
+
+    Raises:
+        ValueError:       If filename is empty, escapes BASE_DIR, or has a
+                          disallowed extension.
+        FileNotFoundError: If the resolved path does not exist on disk.
+    """
+    # --- Input validation: reject None, non-string, and empty inputs ---
+    if not isinstance(filename, str):
+        filename = ""
+    filename = filename.strip()
+    # Strip control characters — prevent null-byte injection and similar tricks
+    filename = re.sub(r'[\x00-\x1f\x7f]', '', filename)
+
+    if not filename:
+        raise ValueError("Invalid input: filename cannot be empty.")
+
+    # --- Strip any folder prefix the caller may have included ---
+    # Callers may pass "emails\sample.txt" or just "sample.txt".
+    # Using only the basename ensures we always join a plain filename
+    # with BASE_DIR — never a path that already contains the folder.
+    filename = os.path.basename(filename)
+
+    if not filename:
+        raise ValueError("Invalid input: filename cannot be empty.")
+
+    # --- Define the only directory that file access is permitted in ---
+    # BASE_DIR is constructed from the script's own location so it is always
+    # an absolute path, regardless of the caller's working directory.
+    BASE_DIR = os.path.realpath(os.path.join(script_dir, "emails"))
+
+    # --- Resolve the full absolute path, collapsing all '..' segments ---
+    # os.path.realpath() follows symlinks and removes traversal sequences,
+    # giving us the true filesystem path the OS would access.
+    resolved = os.path.realpath(os.path.join(BASE_DIR, filename))
+
+    # --- Path containment check — the core traversal defence ---
+    # os.path.commonpath() is used instead of startswith() to avoid a
+    # false positive where BASE_DIR="/emails" matches "/emails-backup/...".
+    if os.path.commonpath([resolved, BASE_DIR]) != BASE_DIR:
+        raise ValueError("Access denied: path outside allowed directory")
+
+    # --- Extension whitelist — only .txt and .eml are valid email files ---
+    allowed_extensions = {".txt", ".eml"}
+    _, ext = os.path.splitext(resolved)
+    if ext.lower() not in allowed_extensions:
+        raise ValueError("Invalid file type: only .txt and .eml allowed")
+
+    # --- Existence check — raise before the caller tries to open the file ---
+    if not os.path.isfile(resolved):
+        raise FileNotFoundError(f"File not found: {filename}")
+
+    return resolved
+
+
 def read_header_file(filename):
-    """Opens and reads the raw email header file 
+    """Opens and reads the raw email header file.
+
+    Calls validate_file_path() first to prevent path traversal before
+    any filesystem read is attempted.
     """
     try:
-        with open(filename, "r") as file:
-            content =file.read()
+        # Security: validate and resolve the path before opening —
+        # rejects traversal attempts, wrong extensions, and missing files.
+        safe_path = validate_file_path(filename)
+        with open(safe_path, "r") as file:
+            content = file.read()
         return content
-    except FileNotFoundError:
-        print(f"Error: File '{filename}' not found.")
-        return None 
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Error: {e}")
+        return None
 def extract_field(header, field_name):
     """Extracts the value of a specified field from the email header.
     Returns the field value as a string, or None if not found.
@@ -1224,6 +1304,7 @@ def process_folder(folder_path):
     print("\n" + "=" * 60)
 
 
-# Run SENTINEL on emails folder
-process_folder("emails")
+if __name__ == "__main__":
+    # Run SENTINEL on emails folder
+    process_folder("emails")
 
