@@ -23,7 +23,111 @@ load_dotenv(dotenv_path=env_path)
 
 
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY")
- 
+
+
+def db_connect():
+    """Creates and returns a MySQL database connection using credentials from environment variables.
+
+    Loads database credentials exclusively from environment variables — never from
+    hardcoded values. The .env file is already loaded at module level via load_dotenv(),
+    so os.getenv() will reflect any values set there.
+
+    Why environment variables:
+    Hardcoding credentials is CWE-798 (Use of Hard-coded Credentials). Storing them
+    in .env and reading them at call time keeps secrets out of source control and
+    allows credentials to be rotated without touching code.
+
+    Each required variable is checked individually before any connection attempt so
+    that the error message names the exact missing variable — making misconfiguration
+    easier to diagnose without exposing any credential values.
+
+    Required environment variables:
+        DB_HOST     — hostname or IP of the MySQL server (e.g. "localhost")
+        DB_PORT     — TCP port as a string (e.g. "3306")
+        DB_NAME     — name of the target database schema
+        DB_USER     — MySQL username
+        DB_PASSWORD — MySQL password
+
+    Returns:
+        mysql.connector.connection.MySQLConnection: an open, authenticated
+        connection object ready for cursor creation.
+
+    Raises:
+        EnvironmentError: If any required environment variable is missing or empty.
+            The message names the specific variable so the caller knows what to fix,
+            but never echoes any credential value.
+        RuntimeError: If the MySQL connection attempt fails for any reason
+            (bad credentials, unreachable host, wrong port, etc.).
+            The message includes only the exception type — never the raw message —
+            to avoid leaking credential or network details.
+    """
+    # --- Lazy import: mysql.connector is only required when this function is called ---
+    # Importing here prevents an ImportError at module load time on systems where
+    # mysql-connector-python is not installed but the rest of SENTINEL is still usable.
+    try:
+        import mysql.connector
+    except ImportError:
+        raise RuntimeError(
+            "mysql-connector-python is not installed. "
+            "Run: pip install mysql-connector-python"
+        )
+
+    # --- Read each credential individually from the environment ---
+    # Checking each variable separately lets us name the exact missing key in the
+    # error message, which is far more useful than a generic "missing config" message.
+    required_vars = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    credentials = {}
+
+    for var in required_vars:
+        # os.getenv returns None if the variable is absent; strip() catches "  " values
+        value = os.getenv(var)
+        if not isinstance(value, str):
+            value = ""
+        # Strip whitespace and control characters — same pattern used across this file
+        value = value.strip()
+        value = re.sub(r'[\x00-\x1f\x7f]', '', value)
+        if not value:
+            raise EnvironmentError(
+                f"Missing required environment variable: {var}. "
+                "Set it in your .env file or shell environment before calling db_connect()."
+            )
+        credentials[var] = value
+
+    # --- Validate DB_PORT is a valid port number before passing to the connector ---
+    # mysql.connector expects an int for port; a non-numeric value would produce a
+    # confusing error deep inside the library rather than a clear config message.
+    try:
+        port = int(credentials["DB_PORT"])
+        if not (1 <= port <= 65535):
+            raise ValueError("port out of range")
+    except ValueError:
+        raise EnvironmentError(
+            f"Invalid DB_PORT value '{credentials['DB_PORT']}': "
+            "must be an integer between 1 and 65535."
+        )
+
+    # --- Attempt the connection — only network I/O happens here ---
+    # All credential values are passed as keyword arguments so nothing is
+    # interpolated into a connection string (no injection surface).
+    try:
+        connection = mysql.connector.connect(
+            host=credentials["DB_HOST"],
+            port=port,
+            database=credentials["DB_NAME"],
+            user=credentials["DB_USER"],
+            password=credentials["DB_PASSWORD"],
+        )
+        return connection
+    except Exception as e:
+        # Never expose the raw exception message — it may contain credential fragments
+        # or internal hostnames. Report only the exception type, consistent with the
+        # safe error-handling pattern used throughout this file.
+        raise RuntimeError(
+            f"Database connection failed ({type(e).__name__}). "
+            "Check DB_HOST, DB_PORT, DB_NAME, DB_USER, and DB_PASSWORD in your .env file."
+        )
+
+
 def validate_file_path(filename):
     """Validates a filename to prevent path traversal attacks.
 
