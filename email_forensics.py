@@ -128,6 +128,161 @@ def db_connect():
         )
 
 
+def save_incident(conn, filename, findings):
+    """Persists a SENTINEL phishing-analysis result to the incidents database table.
+
+    Why parameterized queries (and why never f-strings or concatenation in SQL):
+    SQL injection (CWE-89) is one of the most exploited vulnerability classes.
+    It occurs when attacker-controlled data is embedded directly into a SQL
+    string, letting them escape the intended query and execute arbitrary SQL.
+    For example, a filename value of  "x'; DROP TABLE incidents; --"  would
+    destroy the table if concatenated into the query.
+
+    Parameterized queries (also called prepared statements) prevent this
+    entirely. The SQL template is sent to the database driver separately from
+    the data values. The driver transmits them over different protocol channels
+    so the database engine NEVER interprets a data value as SQL syntax — no
+    matter what characters it contains. This is the only reliable defence;
+    manual escaping is error-prone and must never be used instead.
+
+    The query in this function uses %s placeholders (the mysql-connector-python
+    convention). The values tuple is passed as the second argument to
+    cursor.execute() and is never embedded in the SQL string itself.
+
+    Args:
+        conn:     An active mysql.connector connection object, as returned by
+                  db_connect(). The connection must already be open; this
+                  function does not create or close connections.
+        filename: The email filename string that was analysed (e.g.
+                  "phish_sample.eml"). Used as an audit reference in the row.
+        findings: A dict containing the analysis output from generate_report().
+                  All keys are read with .get() and typed defaults so a
+                  partial or empty dict never causes a KeyError or TypeError.
+
+    Returns:
+        int: The auto-incremented primary key (lastrowid) of the newly inserted
+             row, so the caller can reference this incident in subsequent queries.
+
+    Raises:
+        RuntimeError: If the INSERT or COMMIT fails for any reason. The message
+                      includes only the exception type name — never the raw
+                      message — to avoid leaking schema details or data values.
+    """
+    # --- Input validation: conn ---
+    # We cannot do a deep isinstance check without importing the connector class,
+    # so we duck-type: the object must be truthy and have a cursor method.
+    if not conn or not callable(getattr(conn, "cursor", None)):
+        raise ValueError(
+            "Invalid conn argument: expected an open mysql.connector connection."
+        )
+
+    # --- Input validation: filename ---
+    if not isinstance(filename, str):
+        filename = ""
+    filename = filename.strip()
+    # Strip control characters — consistent with the sanitization used throughout this file
+    filename = re.sub(r'[\x00-\x1f\x7f]', '', filename)
+    if not filename:
+        raise ValueError("Invalid input: filename cannot be empty.")
+
+    # --- Input validation: findings ---
+    # Coerce None to an empty dict so every subsequent .get() call is safe.
+    if not isinstance(findings, dict):
+        findings = {}
+
+    # --- Extract and sanitize each field with a typed safe default ---
+    # Using .get() with explicit defaults means a missing or None key never
+    # propagates to the database as an unexpected type.
+
+    risk_level = findings.get("risk_level", "UNKNOWN")
+    if not isinstance(risk_level, str):
+        risk_level = "UNKNOWN"
+    risk_level = re.sub(r'[\x00-\x1f\x7f]', '', risk_level.strip()) or "UNKNOWN"
+
+    confidence_score = findings.get("confidence_score", 0)
+    if not isinstance(confidence_score, int):
+        try:
+            confidence_score = int(confidence_score)
+        except (TypeError, ValueError):
+            confidence_score = 0
+    # Clamp to the valid 0-100 range produced by calculate_confidence()
+    confidence_score = max(0, min(100, confidence_score))
+
+    spoofing_detected = bool(findings.get("spoofing_detected", False))
+    malicious_ip      = bool(findings.get("malicious_ip",      False))
+    urgency_detected  = bool(findings.get("urgency_detected",  False))
+
+    spf_result = findings.get("spf_result", None)
+    if spf_result is not None:
+        if not isinstance(spf_result, str):
+            spf_result = str(spf_result)
+        spf_result = re.sub(r'[\x00-\x1f\x7f]', '', spf_result.strip()) or None
+
+    dkim_result = findings.get("dkim_result", None)
+    if dkim_result is not None:
+        if not isinstance(dkim_result, str):
+            dkim_result = str(dkim_result)
+        dkim_result = re.sub(r'[\x00-\x1f\x7f]', '', dkim_result.strip()) or None
+
+    # mitre_techniques is expected to be a list of dicts (from map_to_mitre()).
+    # We join the technique_id strings into a compact CSV for storage.
+    # If any element is not a dict or lacks "technique_id", it is skipped safely.
+    raw_techniques = findings.get("mitre_techniques", [])
+    if not isinstance(raw_techniques, list):
+        raw_techniques = []
+    technique_ids = []
+    for t in raw_techniques:
+        if isinstance(t, dict):
+            tid = t.get("technique_id", "")
+            if isinstance(tid, str):
+                tid = re.sub(r'[\x00-\x1f\x7f]', '', tid.strip())
+                if tid:
+                    technique_ids.append(tid)
+    mitre_techniques_str = ",".join(technique_ids)  # e.g. "T1566.001,T1598"
+
+    # --- Parameterized INSERT — data values are NEVER embedded in the SQL string ---
+    # Each %s is a placeholder; mysql-connector-python transmits the values tuple
+    # to the server separately, so no value is ever parsed as SQL syntax.
+    sql = (
+        "INSERT INTO incidents "
+        "  (filename, risk_level, confidence_score, spoofing_detected, "
+        "   malicious_ip, spf_result, dkim_result, urgency_detected, mitre_techniques) "
+        "VALUES "
+        "  (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    values = (
+        filename,
+        risk_level,
+        confidence_score,
+        spoofing_detected,
+        malicious_ip,
+        spf_result,
+        dkim_result,
+        urgency_detected,
+        mitre_techniques_str,
+    )
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, values)   # values are bound by the driver, not the string
+        conn.commit()
+        row_id = cursor.lastrowid
+        cursor.close()
+        return row_id
+    except Exception as e:
+        # Roll back any partial write so the connection stays in a clean state
+        try:
+            conn.rollback()
+        except Exception:
+            pass  # Rollback failure is non-fatal — we still raise the original error
+        # Report only the exception type — never the raw message, which may contain
+        # table names, column names, or fragments of the values being inserted.
+        raise RuntimeError(
+            f"Failed to save incident for '{filename}' ({type(e).__name__}). "
+            "Verify the incidents table exists and the connection is still open."
+        )
+
+
 def validate_file_path(filename):
     """Validates a filename to prevent path traversal attacks.
 
@@ -1161,6 +1316,17 @@ def calculate_confidence(findings):
 
 def generate_report(filename):
     """Generates a forensic report based on the email header analysis."""
+    # --- Attempt database connection before any analysis begins ---
+    # Wrapped in a bare except so a missing .env, unreachable host, or any
+    # other failure never prevents SENTINEL from running. If the connection
+    # fails, conn stays None and the save step is silently skipped later.
+    # type(e).__name__ keeps the warning message free of credential details.
+    try:
+        conn = db_connect()
+    except Exception as e:
+        conn = None
+        print(f"⚠️  Database unavailable ({type(e).__name__}) — analysis will continue without saving.")
+
     print("=" * 60)
     print(f" Forensic Analysis Report for '{filename}'")
     print("=" * 60)     
@@ -1302,6 +1468,37 @@ def generate_report(filename):
         "suspicious_tld":    tld_detected
     }
     confidence = calculate_confidence(confidence_findings)
+
+    # --- Persist incident to MySQL — only if the connection succeeded earlier ---
+    # The outer try/except ensures a write failure (lost connection, schema mismatch,
+    # disk full, etc.) never aborts the report the analyst is waiting to read.
+    # The finally block guarantees conn.close() is always called regardless of
+    # whether save_incident() succeeds or raises — no connection is leaked.
+    if conn is not None:
+        try:
+            db_findings = {
+                "risk_level":        confidence["risk_level"],
+                "confidence_score":  confidence["confidence_score"],
+                "spoofing_detected": bool(flags),
+                "malicious_ip":      ip_risk_detected,
+                # Store the human-readable pass/fail string that save_incident()
+                # expects; the raw check_spf / check_dkim dicts stay internal.
+                "spf_result":        "PASS" if spf_result.get("spf_pass") else "FAIL",
+                "dkim_result":       "PASS" if dkim_result.get("dkim_key_found") else "FAIL",
+                "urgency_detected":  urgency_result["urgency_detected"],
+                "mitre_techniques":  techniques,  # list of dicts from map_to_mitre()
+            }
+            clean_filename = os.path.basename(filename)
+            row_id = save_incident(conn, clean_filename, db_findings)
+            print(f"💾 Incident saved to database (id: {row_id})")
+        except Exception as e:
+            # type(e).__name__ only — raw messages may expose table/column details
+            print(f"⚠️  Database save failed ({type(e).__name__}) — continuing without saving.")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass  # Close failure is non-fatal — the report must still print
 
     print("\n📊 CONFIDENCE SCORE")
     print("-" * 40)
