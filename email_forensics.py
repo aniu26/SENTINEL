@@ -1160,19 +1160,53 @@ def calculate_confidence(findings):
     How the weighting model was designed:
     Weights reflect the relative reliability of each signal as a phishing
     indicator, informed by published threat intelligence research:
-        - Domain spoofing (+25) is the single strongest indicator — it is
-          the defining characteristic of impersonation attacks.
-        - Malicious IP (+20) confirms the sending infrastructure is known-bad
-          according to community threat intelligence (AbuseIPDB).
+        - Domain spoofing (+30) is the single strongest indicator — it is
+          the defining characteristic of impersonation attacks. Weight raised
+          from +25 to +30 to better separate high-confidence phishing from
+          borderline cases.
+        - Malicious IP (+25) confirms the sending infrastructure is known-bad
+          according to community threat intelligence (AbuseIPDB). Weight raised
+          from +20 to +25 because a confirmed malicious IP is a highly
+          reliable, independently verified signal.
         - Tor/VPN/Proxy (+15) indicates deliberate anonymisation of origin.
-        - Authentication failures (+10 each) are common in phishing but also
-          occur on misconfigured legitimate mail, so they carry less weight.
-        - Urgency language (+10) is a soft signal — keyword matching cannot
-          confirm intent and generates false positives on legitimate alerts.
-        - MITRE technique count (+5 each, cap +15) rewards corroboration
-          across multiple tactic categories rather than one repeated signal.
+          Unchanged — remains a moderate corroborating signal.
+        - Combined SPF+DKIM failure (+20, new) — both checks failing together
+          is a materially stronger signal than either alone, because it
+          eliminates the common false-positive case of a forwarded email that
+          breaks one check but not the other. Modelled as a separate additive
+          bonus applied on top of the individual failure weights below.
+        - SPF failure alone (+5, was +10) — reduced because forwarded emails
+          commonly break SPF without being malicious. The individual weight now
+          reflects this as a weak corroborating signal rather than a primary one.
+        - DKIM failure alone (+5, was +10) — same rationale as SPF: forwarding
+          rewrites headers and invalidates DKIM on legitimate mail, so a lone
+          DKIM failure is not reliably indicative of phishing.
+        - Urgency language (+5, was +10) — reduced because legitimate transac-
+          tional emails (password resets, shipping alerts, banking notices) also
+          use urgency language, making this a high false-positive signal. It now
+          serves as a minor corroborating factor rather than a primary indicator.
+        - Suspicious TLD (+10) — unchanged; specific high-abuse TLDs remain a
+          reliable indicator of spam and phishing infrastructure.
+        - MITRE technique count (+5 each, cap +15) — unchanged; rewards
+          corroboration across multiple tactic categories.
     Negative adjustments reward clean signals to prevent over-classification
-    of legitimate email with one suspicious characteristic.
+    of legitimate email with one suspicious characteristic:
+        - Clean IP (-15, was -10) — increased because an AbuseIPDB score of 0
+          means the IP has zero community reports across millions of submissions,
+          making it one of the most reliable clean signals available.
+        - SPF pass (-8, was -5) — increased to balance the reduced individual
+          failure weight; a passing SPF check meaningfully lowers risk.
+        - DKIM pass (-8, was -5) — same rationale as SPF pass.
+        - No spoofing (-8, was -5) — increased to match the raised spoofing
+          addition weight, keeping the symmetric reward/penalty balanced.
+
+    Risk level thresholds (revised):
+        - 0-25  → LOW    (was 0-30)
+        - 26-55 → MEDIUM (was 31-60)
+        - 56-100 → HIGH  (was 61-100)
+    Thresholds shifted down slightly to account for the higher ceiling on
+    positive signals; without this adjustment the new weights would push
+    more borderline cases into HIGH than the model intends.
 
     Limitations of the current model:
         - The weights are heuristic, not trained on labelled data. A machine
@@ -1186,9 +1220,6 @@ def calculate_confidence(findings):
         - suspicious_tld is an optional key not yet populated by the main
           report pipeline. It is ready to activate when check_spoofing()
           is updated to return TLD findings in structured form.
-        - The model does not account for the combination of signals — two
-          independent HIGH-confidence indicators together are stronger evidence
-          than their individual scores suggest.
 
     Args:
         findings: A dictionary of observed indicators. All keys are optional;
@@ -1207,7 +1238,7 @@ def calculate_confidence(findings):
     Returns:
         A dictionary with:
             confidence_score — int 0-100: the aggregated weighted score
-            risk_level       — str: "LOW" (0-30), "MEDIUM" (31-60), "HIGH" (61-100)
+            risk_level       — str: "LOW" (0-25), "MEDIUM" (26-55), "HIGH" (56-100)
             score_breakdown  — list of str: one entry per factor explaining its contribution
             details          — str: one-line human-readable summary
     """
@@ -1240,28 +1271,38 @@ def calculate_confidence(findings):
 
     # --- Risk additions ---
     if spoofing_detected:
-        score += 25
-        breakdown.append("+25: Domain spoofing detected (From/Reply-To/Return-Path mismatch)")
+        score += 30
+        breakdown.append("+30: Domain spoofing detected (From/Reply-To/Return-Path mismatch)")
 
     if malicious_ip:
-        score += 20
-        breakdown.append("+20: Originating IP flagged as malicious by AbuseIPDB")
+        score += 25
+        breakdown.append("+25: Originating IP flagged as malicious by AbuseIPDB")
 
     if tor_vpn_detected:
         score += 15
         breakdown.append("+15: Tor/VPN/Proxy detected on originating IP")
 
-    if not spf_pass:
-        score += 10
-        breakdown.append("+10: SPF check failed — sender not authorised by domain policy")
+    # Combined SPF+DKIM failure is a stronger signal than either alone — forwarded
+    # emails typically break one check but not both, so dual failure is more
+    # indicative of a genuinely forged sender. Applied before the individual
+    # per-check additions below so the breakdown clearly shows the bonus.
+    spf_fail  = not spf_pass
+    dkim_fail = not dkim_pass
+    if spf_fail and dkim_fail:
+        score += 20
+        breakdown.append("+20: Both SPF and DKIM failed — combined authentication failure")
 
-    if not dkim_pass:
-        score += 10
-        breakdown.append("+10: DKIM check failed — no valid public key found in DNS")
+    if spf_fail:
+        score += 5
+        breakdown.append("+5: SPF check failed — sender not authorised by domain policy")
+
+    if dkim_fail:
+        score += 5
+        breakdown.append("+5: DKIM check failed — no valid public key found in DNS")
 
     if urgency_detected:
-        score += 10
-        breakdown.append(f"+10: Urgency/manipulation language detected ({urgency_score} pattern(s) matched)")
+        score += 5
+        breakdown.append(f"+5: Urgency/manipulation language detected ({urgency_score} pattern(s) matched)")
 
     if suspicious_tld:
         score += 10
@@ -1276,28 +1317,28 @@ def calculate_confidence(findings):
 
     # --- Risk reductions ---
     if abuse_score == 0:
-        score -= 10
-        breakdown.append("-10: AbuseIPDB abuse score is 0 — IP has no known community reports")
+        score -= 15
+        breakdown.append("-15: AbuseIPDB abuse score is 0 — IP has no known community reports")
 
     if spf_pass:
-        score -= 5
-        breakdown.append("-5: SPF check passed — sender is authorised by domain policy")
+        score -= 8
+        breakdown.append("-8: SPF check passed — sender is authorised by domain policy")
 
     if dkim_pass:
-        score -= 5
-        breakdown.append("-5: DKIM check passed — valid public key found in DNS")
+        score -= 8
+        breakdown.append("-8: DKIM check passed — valid public key found in DNS")
 
     if not spoofing_detected:
-        score -= 5
-        breakdown.append("-5: No domain spoofing detected")
+        score -= 8
+        breakdown.append("-8: No domain spoofing detected")
 
     # Cap final score within 0-100
     score = max(0, min(100, score))
 
     # Determine risk level
-    if score <= 30:
+    if score <= 25:
         risk_level = "LOW"
-    elif score <= 60:
+    elif score <= 55:
         risk_level = "MEDIUM"
     else:
         risk_level = "HIGH"
