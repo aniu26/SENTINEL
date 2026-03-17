@@ -1355,6 +1355,208 @@ def calculate_confidence(findings):
         "details":          details
     }
 
+
+def generate_analyst_notes(findings):
+    """Generates contextual guidance notes for a SOC analyst reviewing a SENTINEL report.
+
+    Purpose:
+    A numeric confidence score tells an analyst *how strongly* the model
+    suspects phishing, but it cannot tell them *why they might be wrong*.
+    generate_analyst_notes() adds a transparent reasoning layer: it inspects
+    the same findings dict and surfaces specific combinations of signals that
+    are known to produce false positives or false negatives in practice. The
+    analyst receives targeted sentences explaining the ambiguity, not just a
+    number to act on blindly.
+
+    Why transparent uncertainty beats perfect scoring:
+    No deterministic scoring model is perfectly calibrated. Attempting to
+    encode every edge case into weights produces an opaque black box that
+    analysts cannot audit or override. The alternative — making uncertainty
+    visible — is better for operational security: an analyst who knows *why*
+    a result might be wrong can apply contextual judgment that no algorithm
+    has. Surfacing known ambiguities explicitly builds analyst trust in the
+    tool and reduces both the over-dismissal of true positives and the
+    over-escalation of false positives.
+
+    How each condition maps to real-world false positive / false negative
+    scenarios:
+
+        Condition 1 — SPF pass + DKIM fail:
+            A common legitimate scenario: bulk senders (Mailchimp, HubSpot)
+            often sign with their own DKIM key on a subdomain that does not
+            match the From address domain, causing DKIM to fail against the
+            apparent sender. SPF passing alone is weaker than both passing —
+            an attacker can register their own domain and set up a valid SPF
+            record. This combination warrants a second look before dismissal.
+
+        Condition 2 — Proxy/VPN detected + AbuseIPDB score = 0:
+            AbuseIPDB is community-sourced and lags newly spun-up
+            infrastructure by hours or days. A score of 0 does not mean
+            clean — it may mean the IP is too fresh to have reports yet.
+            Equally, corporate or privacy VPNs score 0 legitimately. The
+            analyst must resolve this ambiguity manually.
+
+        Condition 3 — Urgency detected + body not analyzed:
+            SENTINEL's urgency detector currently operates on the Subject
+            line only. Phishing emails embed their social engineering
+            pressure primarily in the body. A positive urgency signal on
+            the subject alone underestimates the true urgency score; a
+            negative result does not rule out body-level manipulation.
+
+        Condition 4 — MEDIUM risk level:
+            The MEDIUM band (26-55) is the model's honest "I don't know"
+            zone. Signals exist but are contradictory or too few to resolve.
+            Automated playbooks should not act on MEDIUM scores without
+            a human review step in between.
+
+        Condition 5 — High score despite SPF pass:
+            Analysts sometimes use a single clean signal to dismiss an
+            alert. SPF passing is not a green light: attackers routinely
+            register look-alike domains with valid SPF records, or abuse
+            a legitimate domain's overly broad SPF include chain. A high
+            confidence score in the presence of a passing SPF check means
+            other strong signals (spoofing, malicious IP, MITRE mapping)
+            outweigh the authentication result.
+
+        Condition 6 — Low score but spoofing detected:
+            A low overall score can mask a single high-value indicator.
+            Domain spoofing is the defining characteristic of impersonation
+            attacks; the mismatch should be investigated regardless of what
+            the aggregate score says. This note prevents analysts from
+            dismissing a genuinely suspicious email because the total
+            number looked small.
+
+    Future development (v0.6):
+    These deterministic rule-based notes will be complemented by an AI
+    reasoning layer in SENTINEL v0.6. Where these notes apply fixed
+    if/then logic, the AI layer will generate free-text contextual
+    reasoning tailored to the specific values in the findings dict —
+    for example, explaining *why* a particular IP's geolocation combined
+    with the sender domain makes the email suspicious, rather than
+    applying a generic template. The deterministic notes will remain as
+    an auditable baseline that the AI reasoning supplements rather than
+    replaces.
+
+    Args:
+        findings: A dictionary of analysis results. All keys are optional;
+                  missing keys receive typed safe defaults. Recognised keys:
+                      spf_pass         — bool (default True)
+                      dkim_pass        — bool (default True)
+                      tor_vpn_detected — bool (default False)
+                      abuse_score      — int  (default 0, range 0-100)
+                      urgency_detected — bool (default False)
+                      body_analyzed    — bool (default False)
+                      risk_level       — str  (default "UNKNOWN")
+                      confidence_score — int  (default 0)
+                      spoofing_detected — bool (default False)
+
+    Returns:
+        list of str: One string per triggered condition, in evaluation order.
+                     Empty list if no conditions apply.
+    """
+    # --- Input validation: coerce non-dict to empty dict ---
+    # Every subsequent .get() call is safe regardless of what the caller passes.
+    if not isinstance(findings, dict):
+        findings = {}
+
+    # --- Safe extraction with typed defaults ---
+    spf_pass         = bool(findings.get("spf_pass",         True))
+    dkim_pass        = bool(findings.get("dkim_pass",         True))
+    tor_vpn_detected = bool(findings.get("tor_vpn_detected", False))
+    urgency_detected = bool(findings.get("urgency_detected", False))
+    body_analyzed    = bool(findings.get("body_analyzed",    False))
+    spoofing_detected = bool(findings.get("spoofing_detected", False))
+
+    abuse_score = findings.get("abuse_score", 0)
+    if not isinstance(abuse_score, int):
+        try:
+            abuse_score = int(abuse_score)
+        except (TypeError, ValueError):
+            abuse_score = 0
+    abuse_score = max(0, min(100, abuse_score))
+
+    confidence_score = findings.get("confidence_score", 0)
+    if not isinstance(confidence_score, int):
+        try:
+            confidence_score = int(confidence_score)
+        except (TypeError, ValueError):
+            confidence_score = 0
+    confidence_score = max(0, min(100, confidence_score))
+
+    risk_level = findings.get("risk_level", "UNKNOWN")
+    if not isinstance(risk_level, str):
+        risk_level = "UNKNOWN"
+    # Strip control characters — consistent with sanitization used throughout this file
+    risk_level = re.sub(r'[\x00-\x1f\x7f]', '', risk_level.strip()).upper() or "UNKNOWN"
+
+    notes = []
+
+    # --- Condition 1: SPF passed but DKIM failed ---
+    # Bulk-sending intermediaries frequently rewrite headers in ways that break
+    # DKIM while leaving SPF intact on legitimate mail. The note tells the analyst
+    # not to treat the SPF pass as a full clean signal in isolation.
+    if spf_pass and not dkim_pass:
+        notes.append(
+            "SPF passed but DKIM failed. SPF only verifies domain policy — not whether "
+            "this specific server is authorised. If email appears legitimate, verify "
+            "sender through a separate channel."
+        )
+
+    # --- Condition 2: Proxy/VPN detected but AbuseIPDB score is 0 ---
+    # Community threat intelligence lags fresh infrastructure by hours to days.
+    # A score of 0 cannot distinguish a brand-new malicious relay from a
+    # legitimate corporate VPN — manual verification is the only resolution.
+    if tor_vpn_detected and abuse_score == 0:
+        notes.append(
+            "Proxy/VPN detected but AbuseIPDB score is 0. Could be fresh malicious "
+            "infrastructure not yet reported to AbuseIPDB, or a legitimate privacy tool. "
+            "Verify IP manually at abuseipdb.com."
+        )
+
+    # --- Condition 3: Urgency detected but body was not analyzed ---
+    # The urgency detector currently runs on the Subject line only. A positive
+    # result therefore underestimates total urgency; a negative result does not
+    # rule out body-level social engineering. Either way, body review is needed.
+    if urgency_detected and not body_analyzed:
+        notes.append(
+            "Urgency language detected in subject line only. Email body was not analyzed. "
+            "Check full email body for additional social engineering language before "
+            "making final decision."
+        )
+
+    # --- Condition 4: MEDIUM risk level ---
+    # MEDIUM (26-55) is the model's explicit uncertainty band. Signals exist but
+    # are too few or too contradictory to resolve without human judgment.
+    if risk_level == "MEDIUM":
+        notes.append(
+            "MEDIUM confidence — signals are inconclusive. Manual investigation "
+            "recommended before taking any action."
+        )
+
+    # --- Condition 5: High score despite SPF pass ---
+    # Analysts sometimes use a single clean authentication result to dismiss an
+    # alert. This note prevents that: attackers can and do register their own
+    # domains with valid SPF records, or abuse overly broad SPF include chains.
+    if confidence_score >= 56 and spf_pass:
+        notes.append(
+            "High risk score despite SPF pass. Do not use SPF pass to dismiss this "
+            "email. Attacker may have set up their own domain with valid SPF, or "
+            "exploited an SPF include chain."
+        )
+
+    # --- Condition 6: Low score but spoofing detected ---
+    # Aggregate scores can be dragged down by clean signals that co-exist with
+    # one strong indicator. Domain spoofing is the defining characteristic of
+    # impersonation attacks and must be investigated regardless of total score.
+    if confidence_score <= 25 and spoofing_detected:
+        notes.append(
+            "Low overall score but spoofing was detected. Spoofing alone is a strong "
+            "indicator — investigate the domain mismatch before dismissing."
+        )
+
+    return notes
+
+
 def generate_report(filename):
     """Generates a forensic report based on the email header analysis."""
     # --- Attempt database connection before any analysis begins ---
@@ -1564,6 +1766,28 @@ def generate_report(filename):
         print("   → Flag for manual review by security team")
     else:
         print("✅ LOW RISK — No obvious phishing indicators found")
+
+    # --- Analyst notes: surface known false-positive / false-negative scenarios ---
+    notes_findings = {
+        "spf_pass":         spf_result.get("spf_pass",          False),
+        "dkim_pass":        dkim_result.get("dkim_key_found",    False),
+        "tor_vpn_detected": ip_risk_detected,
+        "abuse_score":      max_abuse_score,
+        "urgency_detected": urgency_result["urgency_detected"],
+        "body_analyzed":    False,  # body parsing not yet implemented
+        "risk_level":       confidence["risk_level"],
+        "confidence_score": confidence["confidence_score"],
+        "spoofing_detected": bool(flags),
+    }
+    analyst_notes = generate_analyst_notes(notes_findings)
+
+    if analyst_notes:
+        print("\n📋 ANALYST NOTES")
+        print("-" * 40)
+        for i, note in enumerate(analyst_notes):
+            print(f"⚠️  {note}")
+            if i < len(analyst_notes) - 1:
+                print()
 
 # Privacy note — this is your differentiator
     print("\n🔒 PRIVACY NOTE")
