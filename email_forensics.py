@@ -6,6 +6,7 @@
 import re
 import requests
 import os
+import time
 import dns.resolver
 from dotenv import load_dotenv
 
@@ -23,6 +24,10 @@ load_dotenv(dotenv_path=env_path)
 
 
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY")
+
+# Tracks the monotonic timestamp of the last AbuseIPDB API call.
+# Used by check_abuseipdb() to enforce a minimum inter-call delay.
+_last_abuseipdb_call = 0.0
 
 
 def db_connect():
@@ -457,6 +462,26 @@ def geolocate_ip(ip):
 def check_abuseipdb(ip):
     """Queries AbuseIPDB to check if an IP has been
     reported as malicious by the security community."""
+    # --- Rate limiting ---
+    # AbuseIPDB free tier allows 1000 requests/day. In batch mode SENTINEL may
+    # call this function for every IP in every email — without a delay we could
+    # exhaust the daily quota in a single large batch or trigger AbuseIPDB's
+    # abuse detection and get the API key suspended.
+    # 1.5 seconds per call caps throughput at ~40 requests/minute (~57,600/day),
+    # well within the free tier and safely below any burst-detection threshold.
+    #
+    # time.monotonic() is used instead of time.time() because monotonic() is
+    # guaranteed to never go backwards — it is unaffected by NTP corrections,
+    # DST changes, or the user manually adjusting the system clock. time.time()
+    # could jump backwards and make the elapsed calculation negative, causing
+    # the sleep to be skipped or producing an incorrect delay.
+    global _last_abuseipdb_call
+    _MIN_INTERVAL = 1.5  # seconds between calls
+    elapsed = time.monotonic() - _last_abuseipdb_call
+    if elapsed < _MIN_INTERVAL:
+        time.sleep(_MIN_INTERVAL - elapsed)
+    _last_abuseipdb_call = time.monotonic()
+
     if not ABUSEIPDB_KEY:
         print("AbuseIPDB API key not found in .env file")
         return None
