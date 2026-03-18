@@ -432,33 +432,207 @@ def check_spoofing(from_field, reply_to, return_path):
             flags.append(f" ALERT: Reply-To domain ({reply_domain}) uses a TLD ({tld}).")
     return flags
 def geolocate_ip(ip):
-    """ Queries ip-api.com to get location and VPN/Tor/Proxy
+    """Queries ip-api.com to get location and VPN/Tor/Proxy
     information about an IP address.
+
+    Tries geolocate_ip_local() first for city/country data from the
+    offline MaxMind GeoLite2-City database. If that succeeds, ip-api.com
+    is still queried so its ISP, org, proxy, VPN, and Tor fields can be
+    merged in — GeoLite2 free tier does not include those signals.
+
+    Fallback behaviour:
+      - Local hit  + ip-api.com success  → merged result (best of both)
+      - Local hit  + ip-api.com failure  → local result with
+                                           "Unknown (offline)" for
+                                           isp/org/proxy/tor/vpn fields
+      - Local miss + ip-api.com success  → ip-api.com result only
+      - Local miss + ip-api.com failure  → None
     """
+    # --- Step 1: attempt offline local lookup ---
+    # Returns a dict on success, None if the IP is not in the local DB
+    # or the database file is absent. Never raises.
+    local_result = geolocate_ip_local(ip)
+
+    # --- Step 2: attempt ip-api.com for ISP/proxy/tor/vpn data ---
     try:
         url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,org,proxy,vpn,tor,hosting"
         response = requests.get(url, timeout=5)
         data = response.json()
         if data.get("status") == "success":
-            return {
-                "country": data.get("country", "Unknown"),
-                "country_code": data.get("countryCode","??"),
-                "city": data.get("city", "Unknown"),
-                "isp": data.get("isp", "Unknown"),
-                "org": data.get("org","Unknown"),
-                "is_proxy": data.get("proxy", False),
-                "is_vpn": data.get("vpn",False),
-                "is_tor": data.get("tor",False),
-                "is_hosting": data.get("hosting",False)
-            }
+            if local_result is not None:
+                # Merge: use local DB for city/country (MaxMind data is
+                # often more precise); use ip-api.com for the fields that
+                # GeoLite2 free tier omits entirely.
+                return {
+                    "country":      local_result.get("country",      data.get("country",      "Unknown")),
+                    "country_code": local_result.get("country_code", data.get("countryCode",  "??")),
+                    "city":         local_result.get("city",         data.get("city",         "Unknown")),
+                    "isp":          data.get("isp",     "Unknown"),
+                    "org":          data.get("org",     "Unknown"),
+                    "is_proxy":     data.get("proxy",   False),
+                    "is_vpn":       data.get("vpn",     False),
+                    "is_tor":       data.get("tor",     False),
+                    "is_hosting":   data.get("hosting", False),
+                    "latitude":     local_result.get("latitude"),
+                    "longitude":    local_result.get("longitude"),
+                    "geo_source":   "GeoLite2 + ip-api.com",
+                }
+            else:
+                # No local result — return ip-api.com data unchanged
+                return {
+                    "country":      data.get("country",     "Unknown"),
+                    "country_code": data.get("countryCode", "??"),
+                    "city":         data.get("city",        "Unknown"),
+                    "isp":          data.get("isp",         "Unknown"),
+                    "org":          data.get("org",         "Unknown"),
+                    "is_proxy":     data.get("proxy",       False),
+                    "is_vpn":       data.get("vpn",         False),
+                    "is_tor":       data.get("tor",         False),
+                    "is_hosting":   data.get("hosting",     False),
+                    "geo_source":   "ip-api.com",
+                }
         else:
-            return None
+            # ip-api.com returned a non-success status; fall back to
+            # whatever the local lookup produced (may be None).
+            return local_result
     except requests.exceptions.Timeout:
         print(f"TIMEOUT- Could not geolocate IP {ip} within timeout period.")
-        return None
+        # Local result (if any) is better than nothing
+        if local_result is not None:
+            local_result["geo_source"] = "GeoLite2 (offline)"
+        return local_result
     except requests.exceptions.ConnectionError:
         print(f"CONNECTION ERROR- Check your internet connection.")
+        if local_result is not None:
+            local_result["geo_source"] = "GeoLite2 (offline)"
+        return local_result
+
+
+def geolocate_ip_local(ip):
+    """Looks up an IP address in the local MaxMind GeoLite2-City database.
+
+    Why local database first — privacy, speed, and air-gap support:
+        Every call to ip-api.com discloses an IP address to a third-party
+        server. In an investigation context the IPs under analysis may be
+        sensitive — belonging to a victim's mail infrastructure, an
+        internal relay, or a threat actor whose activity the organisation
+        does not want to reveal externally. A local MaxMind database
+        resolves location data entirely on-device with no network traffic
+        and no per-query rate limit, while also working in air-gapped or
+        offline environments where ip-api.com is unreachable.
+
+    Why ip-api.com is still used for proxy/tor/vpn detection:
+        The MaxMind GeoLite2-City database (the free tier distributed
+        under the GeoLite2 End User License Agreement) contains only
+        city, country, and coordinate data. Proxy, VPN, Tor-exit-node,
+        and hosting-provider flags require the GeoIP2 Anonymous IP
+        database, which is a paid MaxMind product. This function
+        therefore returns is_proxy, is_tor, and is_vpn as False and
+        isp/org as "Unknown (offline)" so the caller knows these fields
+        were not populated rather than genuinely being absent. Full
+        offline proxy/tor/vpn detection is planned for v0.8 via an
+        ip_reputation MySQL cache built from previous ip-api.com lookups.
+
+    Why lazy import:
+        geoip2 is an optional dependency — analysts who have not
+        installed it (pip install geoip2) or have not downloaded the
+        GeoLite2-City.mmdb file can still run SENTINEL against ip-api.com
+        without an ImportError at module load time. Importing inside the
+        function means the error surfaces only if this code path is
+        actually reached, and only as a None return, not a crash.
+
+    Why None on missing file:
+        Returning None signals to geolocate_ip() that the local lookup
+        was unavailable, triggering an automatic fallback to ip-api.com.
+        Raising an exception here would propagate through analyze_ip_
+        intelligence() and potentially abort the entire report for a
+        missing optional file — a disproportionate failure mode.
+
+    Args:
+        ip: An IP address string to look up.
+
+    Returns:
+        dict with keys city, country, country_code, isp, org,
+        is_proxy, is_tor, is_vpn, latitude, longitude on success.
+        None if the database file is absent, the IP is not found,
+        or any error occurs.
+    """
+    # --- Input validation ---
+    if not isinstance(ip, str):
+        ip = ""
+    ip = ip.strip()
+    ip = re.sub(r'[\x00-\x1f\x7f]', '', ip)
+    if not ip:
         return None
+
+    # --- Lazy import: geoip2 is optional ---
+    # ImportError here means the package is not installed; we treat that
+    # the same as a missing database file and return None silently.
+    try:
+        import geoip2.database
+        import geoip2.errors
+    except ImportError:
+        return None
+
+    # --- Locate the database file next to this script ---
+    db_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "GeoLite2-City.mmdb",
+    )
+    if not os.path.isfile(db_path):
+        # File absent — caller falls back to ip-api.com silently
+        return None
+
+    # --- Query the local database ---
+    try:
+        with geoip2.database.Reader(db_path) as reader:
+            response = reader.city(ip)
+
+            # Extract each field with a safe default — MaxMind may return
+            # None for any field when data is not available for that IP.
+            city         = response.city.name
+            country      = response.country.name
+            country_code = response.country.iso_code
+            latitude     = response.location.latitude
+            longitude    = response.location.longitude
+
+            # isinstance checks before use — guard against unexpected
+            # non-string types from the geoip2 response object.
+            if not isinstance(city, str):
+                city = "Unknown"
+            if not isinstance(country, str):
+                country = "Unknown"
+            if not isinstance(country_code, str):
+                country_code = "XX"
+
+            return {
+                "city":         city         or "Unknown",
+                "country":      country      or "Unknown",
+                "country_code": country_code or "XX",
+                # GeoLite2 free tier does not include ISP, proxy, Tor, or
+                # VPN data. Marked explicitly so analysts know these fields
+                # were not populated, not that they are genuinely absent.
+                "isp":          "Unknown (offline)",
+                "org":          "Unknown (offline)",
+                "is_proxy":     False,
+                "is_tor":       False,
+                "is_vpn":       False,
+                "latitude":     latitude,
+                "longitude":    longitude,
+                "geo_source":   "GeoLite2 (local)",
+            }
+
+    except geoip2.errors.AddressNotFoundError:
+        # Private, reserved, or loopback IPs are not in the database —
+        # this is expected and not an error worth reporting.
+        return None
+    except Exception as e:
+        # type(e).__name__ only — never expose raw exception messages
+        # which may contain filesystem paths or internal library details.
+        print(f"geolocate_ip_local: lookup failed ({type(e).__name__})")
+        return None
+
+
 def check_abuseipdb(ip):
     """Queries AbuseIPDB to check if an IP has been
     reported as malicious by the security community."""
@@ -846,6 +1020,8 @@ def analyze_ip_intelligence(ip):
             
         country_code = geo.get('country_code', '??')
         print(f"  🌍 Location:  {geo.get('city', 'Unknown')}, {geo.get('country', 'Unknown')} {get_flag(country_code)}")
+        if geo.get("geo_source"):
+            print(f"  📡 Source:    {geo['geo_source']}")
         print(f"  🏢 ISP:       {geo['isp']}")
         print(f"  🏛️ Org:       {geo['org']}")
         
