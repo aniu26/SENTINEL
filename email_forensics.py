@@ -1578,6 +1578,156 @@ def generate_analyst_notes(findings):
     return notes
 
 
+def analyze_with_ai(findings, report_summary):
+    """Sends email forensics findings to a local Mistral 7B model via Ollama
+    and returns AI-generated reasoning about the email.
+
+    Why local AI, not cloud AI:
+        Privacy. Email forensics findings can contain sender addresses,
+        subject lines, IP addresses, and other personally identifiable or
+        operationally sensitive data. Sending that data to a cloud API
+        (OpenAI, Anthropic, Google, etc.) would mean routing potentially
+        sensitive email content through a third-party server — violating
+        the on-device-only privacy guarantee that is core to SENTINEL's
+        design. Ollama runs entirely on the analyst's machine; no data
+        ever leaves the local network.
+
+    Why Mistral 7B specifically:
+        Mistral 7B offers strong analytical reasoning for a 7-billion
+        parameter model, outperforming comparably sized alternatives on
+        instruction-following tasks. Crucially, it runs entirely on CPU
+        with acceptable latency and fits comfortably within 8 GB of RAM
+        — requirements that match the minimum hardware profile for a
+        typical analyst workstation without a dedicated GPU.
+
+    Why a 60-second timeout:
+        After a period of inactivity Ollama unloads the model weights
+        from memory. The first inference after a cold start requires
+        reloading several gigabytes of weights before generation can
+        begin. On a mid-range CPU this load phase alone can take 30-50
+        seconds. A 60-second timeout accommodates that cold-start
+        latency while still failing fast enough to be useful in a
+        batch context if Ollama has genuinely stopped responding.
+
+    Relationship to deterministic scoring:
+        This function complements, not replaces, the deterministic
+        confidence score produced by calculate_confidence() and the
+        rule-based analyst notes from generate_analyst_notes(). Those
+        functions provide an auditable, reproducible baseline. The AI
+        layer adds contextual reasoning — explaining *why* a particular
+        combination of signals is suspicious rather than applying fixed
+        if/then templates. Both outputs should be read together.
+
+    Args:
+        findings:       A dict of analysis results, as assembled in
+                        generate_report(). All keys are optional; missing
+                        or None values are skipped when building the prompt.
+        report_summary: A plain-text string summarising the key findings
+                        (e.g. the confidence score, risk level, and any
+                        triggered flags). May be empty.
+
+    Returns:
+        str: The AI's assessment text, or a safe error string if Ollama
+             is unavailable, times out, or returns an unexpected response.
+             This function never raises — it always returns a string.
+    """
+    # --- Input validation: findings ---
+    # Coerce non-dict to empty dict so every subsequent .get() is safe.
+    if not isinstance(findings, dict):
+        findings = {}
+
+    # --- Input validation: report_summary ---
+    # Coerce non-string to empty string; strip whitespace and control chars.
+    if not isinstance(report_summary, str):
+        report_summary = ""
+    report_summary = report_summary.strip()
+    report_summary = re.sub(r'[\x00-\x1f\x7f]', '', report_summary)
+
+    # --- Step 1: Quick availability check ---
+    # A lightweight GET to the Ollama root endpoint confirms the daemon is
+    # running before we invest time building the prompt or waiting on the
+    # full inference call. timeout=3 keeps this check nearly instantaneous.
+    # Any failure (ConnectionError, Timeout, OSError) means Ollama is not
+    # reachable — return the "not running" message immediately.
+    try:
+        requests.get("http://127.0.0.1:11434/", timeout=3)
+    except Exception:
+        return (
+            "AI analysis unavailable — Ollama is not running. "
+            "Start Ollama and retry."
+        )
+
+    # --- Build findings summary as plain text key: value lines ---
+    # None values are skipped so the prompt stays concise and the model is
+    # not distracted by fields that carry no information for this email.
+    findings_lines = []
+    for key, value in findings.items():
+        # Skip None values — they add noise without information
+        if value is None:
+            continue
+        # Sanitize both key and value before embedding in the prompt
+        if not isinstance(key, str):
+            key = str(key)
+        key = re.sub(r'[\x00-\x1f\x7f]', '', key.strip())
+        if not isinstance(value, str):
+            value = str(value)
+        value = re.sub(r'[\x00-\x1f\x7f]', '', value.strip())
+        if key:
+            findings_lines.append(f"{key}: {value}")
+    findings_summary = "\n".join(findings_lines)
+
+    # --- Build the analyst prompt ---
+    prompt = (
+        "You are a SOC analyst assistant specialising in email phishing "
+        "detection. Analyse the following email forensics findings and provide "
+        "a concise 3-5 sentence assessment. "
+        "Focus on: what makes this email suspicious or legitimate, what the "
+        "analyst should do next, and any patterns that match known phishing "
+        "campaigns.\n\n"
+        f"Findings:\n{findings_summary}\n\n"
+        f"Report summary:\n{report_summary}\n\n"
+        "Provide only your assessment. No preamble. No markdown formatting."
+    )
+
+    # --- Step 2: Full inference call ---
+    # stream=False tells Ollama to buffer the entire response before returning
+    # it, which simplifies parsing — we get one JSON object instead of a
+    # newline-delimited stream. timeout=60 covers the cold-start model load.
+    try:
+        response = requests.post(
+            "http://127.0.0.1:11434/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        data = response.json()
+        ai_text = data.get("response", "")
+        # isinstance check before calling .strip() — guard against an
+        # unexpected non-string value in the "response" field.
+        if not isinstance(ai_text, str):
+            ai_text = str(ai_text)
+        return ai_text.strip()
+
+    except requests.exceptions.Timeout:
+        return "AI analysis timed out."
+    except requests.exceptions.ConnectionError:
+        # Ollama may have stopped between the availability check and the
+        # inference call (e.g. it crashed on model load). Return the same
+        # "not running" message so the caller sees a consistent error.
+        return (
+            "AI analysis unavailable — Ollama is not running. "
+            "Start Ollama and retry."
+        )
+    except Exception as e:
+        # Catch-all: JSON decode errors, unexpected HTTP errors, etc.
+        # type(e).__name__ only — never expose the raw message, which may
+        # contain fragments of the prompt or internal Ollama error details.
+        return f"AI analysis unavailable ({type(e).__name__})."
+
+
 def generate_report(filename):
     """Generates a forensic report based on the email header analysis."""
     # --- Attempt database connection before any analysis begins ---
@@ -1812,6 +1962,24 @@ def generate_report(filename):
             print(f"⚠️  {note}")
             if i < len(analyst_notes) - 1:
                 print()
+
+    # --- AI analysis: local Mistral 7B via Ollama ---
+    report_summary = (
+        f"Risk level: {confidence['risk_level']}\n"
+        f"Confidence score: {confidence['confidence_score']}/100\n"
+        f"Spoofing detected: {bool(flags)}\n"
+        f"Malicious IP: {malicious_ip_detected}\n"
+        f"Tor/VPN detected: {tor_vpn_detected}\n"
+        f"SPF: {'PASS' if spf_result.get('spf_pass') else 'FAIL'}\n"
+        f"DKIM: {'PASS' if dkim_result.get('dkim_key_found') else 'FAIL'}\n"
+        f"Urgency detected: {urgency_result['urgency_detected']}\n"
+        f"MITRE techniques: {len(techniques)}"
+    )
+    ai_analysis = analyze_with_ai(findings, report_summary)
+
+    print("\n🤖 AI ANALYSIS (Mistral 7B — Local)")
+    print("-" * 40)
+    print(ai_analysis)
 
 # Privacy note — this is your differentiator
     print("\n🔒 PRIVACY NOTE")
