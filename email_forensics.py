@@ -596,7 +596,6 @@ def check_spf(domain):
             "details": f"No SPF record found for {domain}. Domain has TXT records but none start with 'v=spf1'."
         }
     except dns.exception.Timeout:
-        print(f"TIMEOUT- DNS query for {domain} timed out.")
         return {
             "spf_found": False,
             "spf_record": None,
@@ -604,7 +603,6 @@ def check_spf(domain):
             "details": f"DNS timeout while querying SPF record for {domain}."
         }
     except dns.resolver.NXDOMAIN:
-        print(f"NXDOMAIN- Domain {domain} does not exist in DNS.")
         return {
             "spf_found": False,
             "spf_record": None,
@@ -612,7 +610,6 @@ def check_spf(domain):
             "details": f"Domain {domain} does not exist (NXDOMAIN). Likely a spoofed or nonexistent sender domain."
         }
     except dns.resolver.NoAnswer:
-        print(f"NO ANSWER- No TXT records found for {domain}.")
         return {
             "spf_found": False,
             "spf_record": None,
@@ -620,12 +617,11 @@ def check_spf(domain):
             "details": f"No TXT records found for {domain}. Domain exists but publishes no SPF policy."
         }
     except dns.exception.DNSException as e:
-        print(f"DNS ERROR- Unexpected DNS error for {domain}: {e}")
         return {
             "spf_found": False,
             "spf_record": None,
             "spf_pass": False,
-            "details": f"Unexpected DNS error while querying SPF record for {domain}: {e}"
+            "details": f"Unexpected DNS error while querying SPF record for {domain}: {type(e).__name__}"
         }
 
 def check_dkim(header_text, domain):
@@ -779,7 +775,6 @@ def check_dkim(header_text, domain):
             "details": f"TXT records found at {query_name} but none contain a DKIM public key (p=)."
         }
     except dns.exception.Timeout:
-        print(f"TIMEOUT- DNS query for {query_name} timed out.")
         return {
             "dkim_header_found": True,
             "dkim_selector": selector,
@@ -788,7 +783,6 @@ def check_dkim(header_text, domain):
             "details": f"DNS timeout while querying DKIM key at {query_name}."
         }
     except dns.resolver.NXDOMAIN:
-        print(f"NXDOMAIN- DKIM record {query_name} does not exist in DNS.")
         return {
             "dkim_header_found": True,
             "dkim_selector": selector,
@@ -800,7 +794,6 @@ def check_dkim(header_text, domain):
             )
         }
     except dns.resolver.NoAnswer:
-        print(f"NO ANSWER- No TXT records found at {query_name}.")
         return {
             "dkim_header_found": True,
             "dkim_selector": selector,
@@ -809,7 +802,6 @@ def check_dkim(header_text, domain):
             "details": f"No TXT records found at {query_name}. DKIM public key is not published for this selector."
         }
     except dns.exception.DNSException as e:
-        print(f"DNS ERROR- Unexpected DNS error querying {query_name}: {type(e).__name__}")
         return {
             "dkim_header_found": True,
             "dkim_selector": selector,
@@ -891,14 +883,18 @@ def analyze_ip_intelligence(ip):
     else:
         print(f"  ❌ AbuseIPDB data unavailable")
     
-    # Return combined risk assessment and raw score for callers
-    tor_or_vpn  = geo and (geo["is_tor"] or geo["is_vpn"] or geo["is_proxy"])
-    high_abuse  = abuse and abuse["abuse_score"] >= 80
-    abuse_score = abuse["abuse_score"] if abuse else 0
+    # Return combined risk assessment with separate flags for each risk type.
+    # Keeping tor_vpn_detected and malicious_ip as distinct booleans prevents
+    # either signal from masking the other when both are present or absent.
+    is_tor_vpn   = bool(geo and (geo["is_tor"] or geo["is_vpn"] or geo["is_proxy"]))
+    is_malicious = bool(abuse and abuse["abuse_score"] >= 50)
+    abuse_score  = abuse["abuse_score"] if abuse else 0
 
     return {
-        "is_risky":    bool(tor_or_vpn or high_abuse),
-        "abuse_score": abuse_score
+        "is_risky":         bool(is_tor_vpn or is_malicious),
+        "tor_vpn_detected": is_tor_vpn,
+        "malicious_ip":     is_malicious,
+        "abuse_score":      abuse_score,
     }
 
 def get_flag(country_code):
@@ -1124,13 +1120,13 @@ def map_to_mitre(findings):
             "reason":         "Domain mismatch detected between From, Reply-To, and Return-Path fields."
         })
 
-    if tor_vpn_detected:
+    if tor_vpn_detected and malicious_ip:
         techniques.append({
             "technique_id":   "T1090.003",
             "technique_name": "Multi-hop Proxy",
             "tactic":         "Command and Control",
             "confidence":     "HIGH",
-            "reason":         "Tor/VPN/Proxy detected on originating IP address."
+            "reason":         "Tor/VPN/Proxy detected AND confirmed malicious by AbuseIPDB."
         })
 
     if not spf_pass and not dkim_pass:
@@ -1148,7 +1144,7 @@ def map_to_mitre(findings):
             "technique_name": "Mail Protocols",
             "tactic":         "Command and Control",
             "confidence":     "HIGH",
-            "reason":         "Originating IP has high abuse score indicating known malicious infrastructure."
+            "reason":         "Originating IP confirmed malicious by AbuseIPDB."
         })
 
     if urgency_detected:
@@ -1631,12 +1627,15 @@ def generate_report(filename):
     print("-" * 40)
     ips = extract_ip_addresses(header)
 
-    ip_risk_detected = False
-    max_abuse_score  = 0
+    tor_vpn_detected      = False
+    malicious_ip_detected = False
+    max_abuse_score       = 0
     for ip in ips:
         result = analyze_ip_intelligence(ip)
-        if result["is_risky"]:
-            ip_risk_detected = True
+        if result["tor_vpn_detected"]:
+            tor_vpn_detected = True
+        if result["malicious_ip"]:
+            malicious_ip_detected = True
         max_abuse_score = max(max_abuse_score, result["abuse_score"])
     # Check for spoofing indicators
     print("\n SPOOFING ANALYSIS")   
@@ -1703,8 +1702,8 @@ def generate_report(filename):
     # Build findings and map to MITRE ATT&CK techniques
     findings = {
         "spoofing_detected": bool(flags),
-        "tor_vpn_detected":  ip_risk_detected,
-        "malicious_ip":      ip_risk_detected,
+        "tor_vpn_detected":  tor_vpn_detected,
+        "malicious_ip":      malicious_ip_detected,
         "spf_pass":          spf_result.get("spf_pass", True),
         "dkim_pass":         dkim_result.get("dkim_key_found", True),
         "urgency_detected":  urgency_result["urgency_detected"]
@@ -1725,8 +1724,8 @@ def generate_report(filename):
     # Build confidence findings and calculate score
     confidence_findings = {
         "spoofing_detected": bool(flags),
-        "malicious_ip":      ip_risk_detected,
-        "tor_vpn_detected":  ip_risk_detected,
+        "malicious_ip":      malicious_ip_detected,
+        "tor_vpn_detected":  tor_vpn_detected,
         "spf_pass":          spf_result.get("spf_pass", True),
         "dkim_pass":         dkim_result.get("dkim_key_found", True),
         "urgency_detected":  urgency_result["urgency_detected"],
@@ -1748,7 +1747,7 @@ def generate_report(filename):
                 "risk_level":        confidence["risk_level"],
                 "confidence_score":  confidence["confidence_score"],
                 "spoofing_detected": bool(flags),
-                "malicious_ip":      ip_risk_detected,
+                "malicious_ip":      malicious_ip_detected,
                 # Store the human-readable pass/fail string that save_incident()
                 # expects; the raw check_spf / check_dkim dicts stay internal.
                 "spf_result":        "PASS" if spf_result.get("spf_pass") else "FAIL",
@@ -1796,7 +1795,7 @@ def generate_report(filename):
     notes_findings = {
         "spf_pass":         spf_result.get("spf_pass",          False),
         "dkim_pass":        dkim_result.get("dkim_key_found",    False),
-        "tor_vpn_detected": ip_risk_detected,
+        "tor_vpn_detected": tor_vpn_detected,
         "abuse_score":      max_abuse_score,
         "urgency_detected": urgency_result["urgency_detected"],
         "body_analyzed":    False,  # body parsing not yet implemented
@@ -1820,8 +1819,7 @@ def generate_report(filename):
     print("✅ Analysis performed entirely on-device")
     print("✅ Only IP addresses sent to external APIs")
     print("✅ No email content shared with third parties")
-    is_high_risk = confidence["risk_level"] == "HIGH"
-    return is_high_risk
+    return confidence["risk_level"]
 def process_folder(folder_path):
     """
     Scans a folder for email files and analyzes each one.
@@ -1854,44 +1852,53 @@ def process_folder(folder_path):
     print(f"\n📬 Found {len(email_files)} email(s) to analyze")
     
     results = {
-        "high_risk": [],
-        "low_risk": [],
-        "errors": []
+        "high_risk":   [],
+        "medium_risk": [],
+        "low_risk":    [],
+        "errors":      []
     }
-    
+
     for i, email_file in enumerate(email_files, 1):
         print(f"\n\n[{i}/{len(email_files)}] Processing: {email_file.name}")
         print("=" * 60)
-        
+
         try:
-            risk = generate_report(str(email_file))
-            if risk:
+            risk_level = generate_report(str(email_file))
+            if risk_level == "HIGH":
                 results["high_risk"].append(email_file.name)
+            elif risk_level == "MEDIUM":
+                results["medium_risk"].append(email_file.name)
             else:
                 results["low_risk"].append(email_file.name)
         except Exception as e:
-            print(f"❌ Error processing {email_file.name}: {e}")
+            print(f"❌ Error processing {email_file.name}: {type(e).__name__}")
             results["errors"].append(email_file.name)
-    
+
     # Final summary
     print("\n\n" + "=" * 60)
     print("   SENTINEL — BATCH ANALYSIS COMPLETE")
     print("=" * 60)
-    print(f"\n📊 Total analyzed:  {len(email_files)}")
-    print(f"🚨 High risk:       {len(results['high_risk'])}")
-    print(f"✅ Low risk:        {len(results['low_risk'])}")
-    print(f"❌ Errors:          {len(results['errors'])}")
-    
+    print(f"\n📊 Total analyzed: {len(email_files)}")
+    print(f"🚨 High risk:      {len(results['high_risk'])}")
+    print(f"⚠️  Medium risk:   {len(results['medium_risk'])}")
+    print(f"✅ Low risk:       {len(results['low_risk'])}")
+    print(f"❌ Errors:         {len(results['errors'])}")
+
     if results["high_risk"]:
-        print(f"\n🚨 HIGH RISK EMAILS DETECTED:")
+        print(f"\n🚨 HIGH RISK EMAILS:")
         for email in results["high_risk"]:
             print(f"   → {email}")
-    
+
+    if results["medium_risk"]:
+        print(f"\n⚠️  MEDIUM RISK EMAILS:")
+        for email in results["medium_risk"]:
+            print(f"   → {email}")
+
     if results["low_risk"]:
-        print(f"\n✅ CLEAN EMAILS:")
+        print(f"\n✅ LOW RISK EMAILS:")
         for email in results["low_risk"]:
             print(f"   → {email}")
-    
+
     print("\n" + "=" * 60)
 
 
