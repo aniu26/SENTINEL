@@ -2677,6 +2677,7 @@ def generate_report(filename):
     print("-" * 40)
     print(react_assessment)
 
+
 # Privacy note — this is your differentiator
     print("\n🔒 PRIVACY NOTE")
     print("-" * 40)
