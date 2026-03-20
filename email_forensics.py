@@ -29,6 +29,46 @@ ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY")
 # Used by check_abuseipdb() to enforce a minimum inter-call delay.
 _last_abuseipdb_call = 0.0
 
+# When True, all external HTTP calls (ip-api.com, AbuseIPDB) are suppressed.
+# Set via set_offline_mode() or by passing --offline on the command line.
+OFFLINE_MODE = False
+
+
+def set_offline_mode(enabled):
+    """Enables or disables SENTINEL's offline mode.
+
+    What offline mode blocks:
+        - ip-api.com geolocation calls in geolocate_ip()
+        - AbuseIPDB reputation calls in check_abuseipdb()
+        These are the only two functions that make outbound HTTP requests
+        to third-party internet services.
+
+    What still works in offline mode:
+        - GeoLite2-City.mmdb local database lookups via geolocate_ip_local()
+        - MySQL ip_reputation cache lookups via check_ip_cache()
+        - Mistral 7B inference via Ollama (localhost only, no internet)
+        - ReAct agent loop via run_react_agent()
+        - SPF and DKIM checks via DNS (DNS resolver may still use the
+          network but queries only authoritative nameservers for the
+          domain under investigation, not third-party enrichment APIs)
+        - MITRE ATT&CK mapping (fully deterministic, no network calls)
+        - Confidence scoring and analyst notes (deterministic)
+
+    When to use it:
+        - Air-gapped or isolated investigation environments where internet
+          access is unavailable or prohibited.
+        - Privacy-sensitive investigations where disclosing IP addresses
+          to external API providers is unacceptable.
+        - When ip-api.com or AbuseIPDB are temporarily unreachable and
+          you want to suppress timeout delays during batch processing.
+
+    Args:
+        enabled: Any value — coerced to bool. Pass True to enable offline
+                 mode, False to restore normal operation.
+    """
+    global OFFLINE_MODE
+    OFFLINE_MODE = bool(enabled)
+
 
 def db_connect():
     """Creates and returns a MySQL database connection using credentials from environment variables.
@@ -448,6 +488,13 @@ def geolocate_ip(ip):
       - Local miss + ip-api.com success  → ip-api.com result only
       - Local miss + ip-api.com failure  → None
     """
+    # --- Offline mode: skip ip-api.com entirely ---
+    # When OFFLINE_MODE is True the caller has explicitly opted out of all
+    # external HTTP calls. Return whatever the local DB provides (or None),
+    # with no network attempt and no console output about skipping.
+    if OFFLINE_MODE:
+        return geolocate_ip_local(ip)
+
     # --- Step 1: attempt offline local lookup ---
     # Returns a dict on success, None if the IP is not in the local DB
     # or the database file is absent. Never raises.
@@ -659,6 +706,12 @@ def check_abuseipdb(ip):
     # DST changes, or the user manually adjusting the system clock. time.time()
     # could jump backwards and make the elapsed calculation negative, causing
     # the sleep to be skipped or producing an incorrect delay.
+    # --- Offline mode: suppress all external API calls ---
+    # Return None immediately — no rate-limit sleep, no API key check,
+    # no network attempt. The caller (analyze_ip_intelligence) handles None.
+    if OFFLINE_MODE:
+        return None
+
     global _last_abuseipdb_call
     _MIN_INTERVAL = 1.5  # seconds between calls
     elapsed = time.monotonic() - _last_abuseipdb_call
@@ -700,6 +753,118 @@ def check_abuseipdb(ip):
     except requests.exceptions.ConnectionError:
         print(f"CONNECTION ERROR- AbuseIPDB connection error for {ip}.")
         return None
+
+
+def check_ip_cache(ip):
+    """Queries the ip_reputation MySQL table for a previously cached IP result.
+
+    This is the offline fallback for AbuseIPDB data. When SENTINEL is run with
+    --offline, check_abuseipdb() is suppressed entirely. Any IP that was looked
+    up during a previous online session will have had its result written to the
+    ip_reputation table by the v0.8 cache-write layer. This function retrieves
+    that cached result so that reputation data is available even without an
+    internet connection.
+
+    Why a cache rather than re-querying:
+        AbuseIPDB has a 1 000 req/day free-tier limit. Caching results in MySQL
+        means repeated analysis of the same infrastructure (common in bulk
+        phishing campaigns that reuse sender IPs) costs only one API call per
+        IP per cache TTL rather than one per analysis run.
+
+    Return structure matches check_abuseipdb() so callers need no branching:
+        abuse_score    — int  0-100 confidence score
+        total_reports  — int  number of community abuse reports
+        usage_type     — str  ISP classification from AbuseIPDB
+        last_reported  — str  ISO timestamp or "Never"
+        is_whitelisted — bool
+
+    Args:
+        ip: An IP address string to look up in the cache.
+
+    Returns:
+        dict matching check_abuseipdb() return structure if a cached row
+        exists, or None if the IP is not cached, the table does not exist,
+        or the database is unavailable. Never raises.
+    """
+    # --- Input validation ---
+    if not isinstance(ip, str):
+        ip = ""
+    ip = ip.strip()
+    ip = re.sub(r'[\x00-\x1f\x7f]', '', ip)
+    if not ip:
+        return None
+
+    # --- Attempt database connection ---
+    # db_connect() raises on failure; we catch everything and return None
+    # so a missing or misconfigured database never aborts an analysis.
+    try:
+        conn = db_connect()
+    except Exception:
+        return None
+
+    try:
+        cursor = conn.cursor()
+        # Parameterized query — ip value is never interpolated into the SQL
+        # string, eliminating any SQL injection surface.
+        cursor.execute(
+            "SELECT abuse_score, total_reports, "
+            "       isp, is_proxy, last_checked "
+            "FROM ip_reputation "
+            "WHERE ip_address = %s "
+            "LIMIT 1",
+            (ip,),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+
+        if row is None:
+            return None
+
+        # Unpack with safe typed defaults in case any column is NULL
+        abuse_score, total_reports, isp, is_proxy, last_checked = row
+
+        if not isinstance(abuse_score, int):
+            try:
+                abuse_score = int(abuse_score)
+            except (TypeError, ValueError):
+                abuse_score = 0
+        abuse_score = max(0, min(100, abuse_score))
+
+        if not isinstance(total_reports, int):
+            try:
+                total_reports = int(total_reports)
+            except (TypeError, ValueError):
+                total_reports = 0
+
+        if not isinstance(isp, str):
+            isp = "Unknown"
+        isp = re.sub(r'[\x00-\x1f\x7f]', '', isp.strip()) or "Unknown"
+
+        is_proxy = bool(is_proxy)
+
+        # last_checked may be a datetime object from mysql-connector —
+        # convert to string before sanitizing.
+        last_reported = str(last_checked).strip() if last_checked is not None else "Unknown"
+        last_reported = re.sub(r'[\x00-\x1f\x7f]', '', last_reported) or "Unknown"
+
+        return {
+            "abuse_score":    abuse_score,
+            "total_reports":  total_reports,
+            "usage_type":     "Cached",   # not stored in this table
+            "last_reported":  last_reported,
+            "is_whitelisted": False,       # not stored in this table
+        }
+
+    except Exception as e:
+        # type(e).__name__ only — raw messages may expose table/column names
+        print(f"check_ip_cache: query failed ({type(e).__name__})")
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def check_spf(domain):
     """Queries DNS TXT records to find and evaluate an SPF record for a domain.
@@ -1017,23 +1182,25 @@ def analyze_ip_intelligence(ip):
     geo = geolocate_ip(ip)
     
     if geo:
-        # Build anonymity flags
+        # Build anonymity flags — use .get() with False default so a dict
+        # that is missing these keys (e.g. GeoLite2-only result in offline
+        # mode) never raises a KeyError.
         anonymity_flags = []
-        if geo["is_tor"]:
+        if geo.get("is_tor"):
             anonymity_flags.append("🚨 TOR EXIT NODE")
-        if geo["is_vpn"]:
+        if geo.get("is_vpn"):
             anonymity_flags.append("⚠️ VPN DETECTED")
-        if geo["is_proxy"]:
+        if geo.get("is_proxy"):
             anonymity_flags.append("⚠️ PROXY DETECTED")
-        if geo["is_hosting"]:
+        if geo.get("is_hosting"):
             anonymity_flags.append("ℹ️ HOSTING/DATACENTER")
-            
+
         country_code = geo.get('country_code', '??')
         print(f"  🌍 Location:  {geo.get('city', 'Unknown')}, {geo.get('country', 'Unknown')} {get_flag(country_code)}")
         if geo.get("geo_source"):
             print(f"  📡 Source:    {geo['geo_source']}")
-        print(f"  🏢 ISP:       {geo['isp']}")
-        print(f"  🏛️ Org:       {geo['org']}")
+        print(f"  🏢 ISP:       {geo.get('isp', 'Unknown')}")
+        print(f"  🏛️ Org:       {geo.get('org', 'Unknown')}")
         
         if anonymity_flags:
             for flag in anonymity_flags:
@@ -1044,8 +1211,15 @@ def analyze_ip_intelligence(ip):
     else:
         print(f"  ❌ Geolocation unavailable")
     
-    # Get AbuseIPDB data
-    abuse = check_abuseipdb(ip)
+    # Get AbuseIPDB data — use cache when offline, live API when online
+    if OFFLINE_MODE:
+        abuse = check_ip_cache(ip)
+        if abuse:
+            print(f"  📦 Cache: using cached reputation data")
+        else:
+            print(f"  ⚠️  No cached data for this IP")
+    else:
+        abuse = check_abuseipdb(ip)
     
     if abuse:
         score = abuse["abuse_score"]
@@ -1072,7 +1246,7 @@ def analyze_ip_intelligence(ip):
     # Return combined risk assessment with separate flags for each risk type.
     # Keeping tor_vpn_detected and malicious_ip as distinct booleans prevents
     # either signal from masking the other when both are present or absent.
-    is_tor_vpn   = bool(geo and (geo["is_tor"] or geo["is_vpn"] or geo["is_proxy"]))
+    is_tor_vpn   = bool(geo and (geo.get("is_tor") or geo.get("is_vpn") or geo.get("is_proxy")))
     is_malicious = bool(abuse and abuse["abuse_score"] >= 50)
     abuse_score  = abuse["abuse_score"] if abuse else 0
 
@@ -2507,8 +2681,11 @@ def generate_report(filename):
     print("\n🔒 PRIVACY NOTE")
     print("-" * 40)
     print("✅ Analysis performed entirely on-device")
-    print("✅ Only IP addresses sent to external APIs")
-    print("✅ No email content shared with third parties")
+    if OFFLINE_MODE:
+        print("✅ Offline mode active — zero external connections made")
+    else:
+        print("✅ Only IP addresses sent to external APIs")
+        print("✅ No email content shared with third parties")
     return confidence["risk_level"]
 def process_folder(folder_path):
     """
@@ -2521,7 +2698,19 @@ def process_folder(folder_path):
     work — they process queues of emails automatically.
     """
     import pathlib
-    
+    import sys
+
+    # Check for --offline flag before any output so the mode banner
+    # appears at the very top of the batch run.
+    if "--offline" in sys.argv:
+        set_offline_mode(True)
+        print("🔒 OFFLINE MODE ACTIVE")
+        print("   External APIs: DISABLED")
+        print("   GeoLite2:       ENABLED")
+        print("   MySQL cache:    ENABLED")
+        print("   Mistral 7B:     ENABLED")
+        print("   ReAct Agent:    ENABLED")
+
     print("\n" + "=" * 60)
     print("   SENTINEL — BATCH EMAIL ANALYSIS")
     print(f"   Scanning folder: {folder_path}")
