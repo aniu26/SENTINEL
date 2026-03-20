@@ -7,7 +7,9 @@ import re
 import requests
 import os
 import time
+import json
 import dns.resolver
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
  #load api key from .env file
@@ -32,6 +34,40 @@ _last_abuseipdb_call = 0.0
 # When True, all external HTTP calls (ip-api.com, AbuseIPDB) are suppressed.
 # Set via set_offline_mode() or by passing --offline on the command line.
 OFFLINE_MODE = False
+
+# When True, process_folder() writes structured batch results to
+# sentinel_results.json after analysis completes.
+JSON_EXPORT_MODE = False
+
+
+def set_json_export_mode(enabled):
+    """Enables or disables JSON export of batch analysis results.
+
+    What JSON export does:
+        After process_folder() completes its batch run it serialises the
+        full results — risk counts, per-email risk levels, errors, and
+        run metadata — to sentinel_results.json in the same directory as
+        this script. The file is overwritten on each run.
+
+    Why SIEM integration matters:
+        JSON is the standard ingestion format for every major SIEM and
+        log-aggregation platform:
+          - Splunk: HTTP Event Collector ingests JSON natively
+          - Elasticsearch / OpenSearch: bulk API accepts newline-delimited JSON
+          - Microsoft Sentinel: custom connector uses JSON over HTTP
+          - IBM QRadar: log source extensions parse JSON events
+        Exporting SENTINEL results as JSON means a single pipeline step
+        (curl, Logstash, Filebeat, or a custom connector) can push
+        phishing analysis results into an organisation's existing
+        detection and alerting infrastructure without any data
+        transformation.
+
+    Args:
+        enabled: Any value — coerced to bool. Pass True to enable JSON
+                 export, False to disable it.
+    """
+    global JSON_EXPORT_MODE
+    JSON_EXPORT_MODE = bool(enabled)
 
 
 def set_offline_mode(enabled):
@@ -2712,6 +2748,12 @@ def process_folder(folder_path):
         print("   Mistral 7B:     ENABLED")
         print("   ReAct Agent:    ENABLED")
 
+    # Check for --json flag — enable structured export for SIEM ingestion.
+    if "--json" in sys.argv:
+        set_json_export_mode(True)
+        print("📤 JSON EXPORT ENABLED")
+        print("   Results will be saved to sentinel_results.json")
+
     print("\n" + "=" * 60)
     print("   SENTINEL — BATCH EMAIL ANALYSIS")
     print(f"   Scanning folder: {folder_path}")
@@ -2780,6 +2822,33 @@ def process_folder(folder_path):
             print(f"   → {email}")
 
     print("\n" + "=" * 60)
+
+    # --- JSON export for SIEM / downstream pipeline ingestion ---
+    if JSON_EXPORT_MODE:
+        try:
+            export_data = {
+                "sentinel_version": "0.8",
+                "exported_at":      datetime.now(timezone.utc).isoformat(),
+                "total_analyzed":   len(email_files),
+                "high_risk":        len(results["high_risk"]),
+                "medium_risk":      len(results["medium_risk"]),
+                "low_risk":         len(results["low_risk"]),
+                "errors":           len(results["errors"]),
+                "offline_mode":     OFFLINE_MODE,
+                "emails": {
+                    "high_risk":   results["high_risk"],
+                    "medium_risk": results["medium_risk"],
+                    "low_risk":    results["low_risk"],
+                    "errors":      results["errors"],
+                },
+            }
+            out_path = os.path.join(script_dir, "sentinel_results.json")
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(export_data, fh, indent=2)
+            print(f"📤 Results exported to sentinel_results.json")
+        except Exception as e:
+            # type(e).__name__ only — raw messages may expose file paths
+            print(f"⚠️  JSON export failed ({type(e).__name__})")
 
 
 if __name__ == "__main__":
