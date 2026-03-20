@@ -586,6 +586,16 @@ def geolocate_ip_local(ip):
     # --- Query the local database ---
     try:
         with geoip2.database.Reader(db_path) as reader:
+            # Validate that ip is a well-formed IPv4 or IPv6 address before
+            # passing it to geoip2. geoip2 raises an unhelpful internal error
+            # on malformed input; ipaddress.ip_address() gives a clean
+            # ValueError that we can intercept and return None safely.
+            import ipaddress
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return None
+
             response = reader.city(ip)
 
             # Extract each field with a safe default — MaxMind may return
@@ -1754,6 +1764,336 @@ def generate_analyst_notes(findings):
     return notes
 
 
+# ---------------------------------------------------------------------------
+# SENTINEL Tool Registry
+# ---------------------------------------------------------------------------
+# Each entry maps a tool name the ReAct agent may invoke to a description,
+# the callable that implements it, and documentation of its expected input
+# and output. Keeping this dict module-level means:
+#   - run_react_agent() never needs to be edited to add a new tool — only
+#     this registry needs updating (open/closed principle).
+#   - The same registry can be serialised into a prompt so the AI sees an
+#     accurate, always-current list of what it can call.
+# All referenced callables must be defined before this dict literal is
+# evaluated, which is why the registry lives after all function definitions.
+# ---------------------------------------------------------------------------
+SENTINEL_TOOLS = {
+    "check_ip_reputation": {
+        "description": (
+            "Check if an IP address has been reported as malicious. "
+            "Use when an unknown or suspicious IP is found in email headers."
+        ),
+        "function": check_abuseipdb,
+        "input":    "ip address string",
+        "output":   "dict with abuse_score and total_reports",
+    },
+    "check_spf_record": {
+        "description": (
+            "Check SPF record for a domain. "
+            "Use when sender domain is unknown or spoofing is suspected."
+        ),
+        "function": check_spf,
+        "input":    "domain string",
+        "output":   "dict with spf_found and spf_pass",
+    },
+    "check_dkim_record": {
+        "description": (
+            "Check DKIM signature for a domain. "
+            "Use when email authentication needs verification."
+        ),
+        "function": check_dkim,
+        "input":    "header text and domain string",
+        "output":   "dict with dkim_key_found",
+    },
+    "geolocate_ip": {
+        "description": (
+            "Get location and network info for an IP. "
+            "Use when IP origin country is relevant to the investigation."
+        ),
+        "function": geolocate_ip,
+        "input":    "ip address string",
+        "output":   "dict with country, city, isp, is_proxy, is_tor",
+    },
+    "detect_urgency": {
+        "description": (
+            "Detect urgency and manipulation language. "
+            "Use when subject line contains suspicious pressure language."
+        ),
+        "function": detect_urgency,
+        "input":    "subject string and optional body string",
+        "output":   "dict with urgency_detected and score",
+    },
+}
+
+
+def run_react_agent(initial_findings, header_text, max_steps=5):
+    """Runs a ReAct (Reasoning + Acting) agent loop over email forensics data.
+
+    What the ReAct pattern is:
+        ReAct interleaves reasoning and acting in a loop. At each step the
+        model is shown the current state of findings and asked to either
+        call one of the available tools to gather more evidence, or declare
+        that it has enough information to produce a final assessment. This
+        mirrors how a human analyst works: form a hypothesis, run a check,
+        update the hypothesis, repeat until confident.
+
+    Why a max_steps limit:
+        Without a hard ceiling the agent could loop indefinitely — either
+        because the model keeps finding new things to check, or because a
+        parsing error causes it to re-request the same tool repeatedly. Five
+        steps is enough for a thorough first-pass investigation of a single
+        email while keeping wall-clock time predictable (each Ollama call
+        can take several seconds on CPU). The limit can be raised by the
+        caller for deeper investigations.
+
+    Why the tool registry approach:
+        Keeping tools in SENTINEL_TOOLS rather than hard-coding them inside
+        this function means new capabilities can be added simply by
+        inserting an entry into the registry — the agent logic here never
+        needs to change. The registry is also serialised directly into the
+        prompt, so the AI always sees an accurate list of what it can call.
+
+    Foundation note:
+        This is the v0.6 ReAct foundation. In v0.8 the tool registry will
+        be extended with ip_reputation cache lookups, attachment hash
+        checking, and link extraction — all without modifying this function.
+
+    Args:
+        initial_findings: A dict of analysis results assembled by
+                          generate_report(). Used as the starting state
+                          for the agent's reasoning loop.
+        header_text:      The raw email header string. Passed to tools
+                          that need full header context (e.g. check_dkim).
+        max_steps:        Maximum number of Thought → Action → Observation
+                          cycles before the agent is forced to stop.
+                          Defaults to 5. Must be a positive integer.
+
+    Returns:
+        str: The agent's final assessment, or a safe error string if Ollama
+             is unavailable, the step limit is reached, or any unrecoverable
+             error occurs. Never raises.
+    """
+    # --- Input validation: initial_findings ---
+    if not isinstance(initial_findings, dict):
+        initial_findings = {}
+
+    # --- Input validation: header_text ---
+    if not isinstance(header_text, str):
+        header_text = ""
+    header_text = header_text.strip()
+    header_text = re.sub(r'[\x00-\x1f\x7f]', '', header_text)
+
+    # --- Input validation: max_steps ---
+    if not isinstance(max_steps, int):
+        try:
+            max_steps = int(max_steps)
+        except (TypeError, ValueError):
+            max_steps = 5
+    # Clamp to a sensible range — 1 minimum, 20 maximum
+    max_steps = max(1, min(20, max_steps))
+
+    # --- Availability check — same pattern as analyze_with_ai() ---
+    try:
+        requests.get("http://127.0.0.1:11434/", timeout=3)
+    except Exception:
+        return "ReAct agent unavailable — Ollama not running."
+
+    # --- Build the tool list for the prompt ---
+    # Serialise SENTINEL_TOOLS into a human-readable block so the model
+    # sees exactly what is available and what each tool expects.
+    tool_descriptions = []
+    for name, meta in SENTINEL_TOOLS.items():
+        if not isinstance(meta, dict):
+            continue
+        desc   = meta.get("description", "") if isinstance(meta.get("description"), str) else ""
+        inp    = meta.get("input",       "") if isinstance(meta.get("input"),       str) else ""
+        output = meta.get("output",      "") if isinstance(meta.get("output"),      str) else ""
+        tool_descriptions.append(
+            f"- {name}\n"
+            f"  Description: {desc}\n"
+            f"  Input:  {inp}\n"
+            f"  Output: {output}"
+        )
+    tools_block = "\n".join(tool_descriptions)
+
+    # --- Mutable state carried across the loop ---
+    # observations accumulates tool results so the model has full context
+    # at every subsequent step.
+    observations = []
+
+    # --- Helper: call Ollama and return the stripped response string ---
+    # Extracted to avoid repeating the same try/except block for each of
+    # the three prompt types. Returns (text, error_string) — exactly one
+    # of the two will be non-empty; the other will be "".
+    def _ollama_call(prompt_text):
+        try:
+            resp = requests.post(
+                "http://127.0.0.1:11434/api/generate",
+                json={"model": "mistral", "prompt": prompt_text, "stream": False},
+                timeout=60,
+            )
+            raw = resp.json().get("response", "")
+            if not isinstance(raw, str):
+                raw = str(raw)
+            return raw.strip(), ""
+        except requests.exceptions.Timeout:
+            return "", "ReAct agent timed out."
+        except requests.exceptions.ConnectionError:
+            return "", "ReAct agent unavailable — Ollama not running."
+        except Exception as e:
+            return "", f"ReAct agent error ({type(e).__name__})."
+
+    # --- Helper: build findings_summary and obs_block from current state ---
+    def _build_context():
+        lines = []
+        for key, value in initial_findings.items():
+            if value is None:
+                continue
+            k = key if isinstance(key, str) else str(key)
+            k = re.sub(r'[\x00-\x1f\x7f]', '', k.strip())
+            v = value if isinstance(value, str) else str(value)
+            v = re.sub(r'[\x00-\x1f\x7f]', '', v.strip())
+            if k:
+                lines.append(f"{k}: {v}")
+        summary = "\n".join(lines)
+        obs = (
+            "\nPrevious observations:\n" + "\n".join(observations)
+            if observations else ""
+        )
+        return summary, obs
+
+    # -----------------------------------------------------------------------
+    # INVESTIGATE loop — Prompt 1 (decision) + Action prompt per step
+    # max_steps limits only this loop; the assessment prompt always runs.
+    # -----------------------------------------------------------------------
+    for step in range(max_steps):
+        findings_summary, obs_block = _build_context()
+
+        # --- Prompt 1: Decision ---
+        # Single-word response keeps parsing trivial and removes the
+        # formatting burden that causes small models to hallucinate.
+        decision_prompt = (
+            "You are a SOC analyst investigating a suspicious email.\n\n"
+            "Current findings:\n"
+            f"{findings_summary}"
+            f"{obs_block}\n\n"
+            "Available tools:\n"
+            f"{tools_block}\n\n"
+            "Do you need to call a tool to get more information, or do you "
+            "have enough to give a final assessment?\n\n"
+            "Reply with exactly one word: INVESTIGATE or CONCLUDE"
+        )
+
+        decision_raw, err = _ollama_call(decision_prompt)
+        if err:
+            return err
+
+        # Treat any response that does not contain INVESTIGATE as CONCLUDE
+        # so a confused or verbose model still reaches the assessment prompt.
+        if "INVESTIGATE" not in decision_raw.upper():
+            break
+
+        # --- Action prompt (only reached when INVESTIGATE) ---
+        action_prompt = (
+            "You are a SOC analyst investigating a suspicious email.\n\n"
+            "Current findings:\n"
+            f"{findings_summary}"
+            f"{obs_block}\n\n"
+            "Available tools:\n"
+            f"{tools_block}\n\n"
+            "Which single tool should you call next and what input should "
+            "you pass?\n\n"
+            "Reply in exactly this format:\n"
+            "TOOL: <tool_name>\n"
+            "INPUT: <input_value>\n\n"
+            "No other text."
+        )
+
+        action_raw, err = _ollama_call(action_prompt)
+        if err:
+            return err
+
+        # --- Parse TOOL: and INPUT: lines ---
+        tool_name  = ""
+        tool_input = ""
+        for line in action_raw.splitlines():
+            line = line.strip()
+            if line.upper().startswith("TOOL:"):
+                tool_name = re.sub(r'[\x00-\x1f\x7f]', '', line[5:].strip())
+            elif line.upper().startswith("INPUT:"):
+                tool_input = re.sub(r'[\x00-\x1f\x7f]', '', line[6:].strip())
+
+        # --- Registry lookup ---
+        if tool_name not in SENTINEL_TOOLS:
+            observations.append(
+                f"Step {step + 1}: Tool '{tool_name}' not found in registry."
+            )
+            continue
+
+        tool_meta = SENTINEL_TOOLS[tool_name]
+        if not isinstance(tool_meta, dict):
+            observations.append(
+                f"Step {step + 1}: Tool '{tool_name}' registry entry is malformed."
+            )
+            continue
+
+        fn = tool_meta.get("function")
+        if not callable(fn):
+            observations.append(
+                f"Step {step + 1}: Tool '{tool_name}' has no callable function."
+            )
+            continue
+
+        # --- Call the tool safely ---
+        # check_dkim_record requires (header_text, domain); all other tools
+        # take a single string. Detected by name to keep agent INPUT simple.
+        try:
+            if tool_name == "check_dkim_record":
+                result = fn(header_text, tool_input)
+            else:
+                result = fn(tool_input)
+
+            if not isinstance(result, str):
+                result = str(result)
+            result = re.sub(r'[\x00-\x1f\x7f]', '', result)
+            observations.append(
+                f"Step {step + 1}: {tool_name}({tool_input!r}) → {result}"
+            )
+            # Surface the tool result as a finding so it appears in
+            # findings_summary on the next iteration.
+            initial_findings[f"agent_obs_{step + 1}"] = result
+
+        except Exception as e:
+            # type(e).__name__ only — raw messages may contain IP data
+            observations.append(
+                f"Step {step + 1}: {tool_name} raised {type(e).__name__}."
+            )
+
+    # -----------------------------------------------------------------------
+    # Prompt 2: Assessment — always reached (CONCLUDE decision, or loop end)
+    # All observations collected during the loop are included so the model
+    # has the full picture regardless of how the loop exited.
+    # -----------------------------------------------------------------------
+    findings_summary, obs_block = _build_context()
+
+    assessment_prompt = (
+        "You are a SOC analyst who has investigated a suspicious email.\n\n"
+        "Findings:\n"
+        f"{findings_summary}"
+        f"{obs_block}\n\n"
+        "Write a concise 2-3 sentence assessment of this email for the "
+        "security team. Be specific about the risk and recommended action. "
+        "No markdown."
+    )
+
+    assessment_raw, err = _ollama_call(assessment_prompt)
+    if err:
+        return err
+
+    assessment_raw = re.sub(r'[\x00-\x1f\x7f]', '', assessment_raw)
+    return assessment_raw if assessment_raw else "Agent produced no assessment."
+
+
 def analyze_with_ai(findings, report_summary):
     """Sends email forensics findings to a local Mistral 7B model via Ollama
     and returns AI-generated reasoning about the email.
@@ -2156,6 +2496,12 @@ def generate_report(filename):
     print("\n🤖 AI ANALYSIS (Mistral 7B — Local)")
     print("-" * 40)
     print(ai_analysis)
+
+    react_assessment = run_react_agent(findings, header, max_steps=5)
+
+    print("\n🔍 REACT AGENT INVESTIGATION")
+    print("-" * 40)
+    print(react_assessment)
 
 # Privacy note — this is your differentiator
     print("\n🔒 PRIVACY NOTE")
