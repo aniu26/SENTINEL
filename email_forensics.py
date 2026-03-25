@@ -25,6 +25,8 @@ load_dotenv(dotenv_path=env_path)
  # Read .env file directly to see what Python sees
 
 
+SENTINEL_VERSION = "0.8"
+
 ABUSEIPDB_KEY = os.getenv("ABUSEIPDB_API_KEY")
 
 # Tracks the monotonic timestamp of the last AbuseIPDB API call.
@@ -579,13 +581,11 @@ def geolocate_ip(ip):
             # whatever the local lookup produced (may be None).
             return local_result
     except requests.exceptions.Timeout:
-        print(f"TIMEOUT- Could not geolocate IP {ip} within timeout period.")
         # Local result (if any) is better than nothing
         if local_result is not None:
             local_result["geo_source"] = "GeoLite2 (offline)"
         return local_result
     except requests.exceptions.ConnectionError:
-        print(f"CONNECTION ERROR- Check your internet connection.")
         if local_result is not None:
             local_result["geo_source"] = "GeoLite2 (offline)"
         return local_result
