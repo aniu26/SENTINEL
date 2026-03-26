@@ -290,6 +290,47 @@ def results():
         return jsonify(list(results_store))
 
 
+@app.route("/export")
+def export_results():
+    """Returns the full results as a downloadable JSON file.
+
+    Builds the same payload structure as the --json CLI flag so the exported
+    file is compatible with downstream tooling that consumes sentinel_results.json.
+    Content-Disposition header instructs the browser to save rather than display.
+    """
+    with _lock:
+        data = list(results_store)
+
+    high   = [r for r in data if r.get("risk_level") == "HIGH"]
+    medium = [r for r in data if r.get("risk_level") == "MEDIUM"]
+    low    = [r for r in data if r.get("risk_level") == "LOW"]
+    errors = [r for r in data if r.get("risk_level") == "ERROR"]
+
+    payload = {
+        "sentinel_version": ef.SENTINEL_VERSION,
+        "exported_at":      datetime.now().isoformat(),
+        "total_analyzed":   len(data),
+        "high_risk":        len(high),
+        "medium_risk":      len(medium),
+        "low_risk":         len(low),
+        "errors":           len(errors),
+        "offline_mode":     ef.OFFLINE_MODE,
+        "emails": {
+            "high_risk":   high,
+            "medium_risk": medium,
+            "low_risk":    low,
+            "errors":      errors,
+        },
+    }
+
+    json_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    return Response(
+        json_bytes,
+        content_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=sentinel_results.json"},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dashboard HTML — single self-contained page, no external dependencies
 # ---------------------------------------------------------------------------
@@ -549,13 +590,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     justify-content: space-between;
   }
   .empty-msg { color: #475569; font-style: italic; font-size: 0.88rem; padding: 1.5rem 0; text-align: center; }
+
+  /* ── Offline badge ── */
+  .badge.offline { background: #7c3aed; color: #fff; font-size: 0.65rem; vertical-align: middle; }
+
+  /* ── Download button ── */
+  .btn-download {
+    padding: 5px 14px;
+    background: #0f172a;
+    color: #94a3b8;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .15s, color .15s, border-color .15s;
+    white-space: nowrap;
+  }
+  .btn-download:hover { background: #1e3a5f; color: #e2e8f0; border-color: #3b82f6; }
+
+  /* ── Error group divider row in results table ── */
+  .error-group-row td {
+    background: #131a27;
+    color: #6b7280;
+    font-size: 0.74rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    padding: .4rem .75rem;
+    border-top: 1px solid #334155;
+    border-bottom: 1px solid #334155;
+  }
 </style>
 </head>
 <body>
 
 <header>
   <div>
-    <div class="logo">&#x1F6E1; SENTINEL</div>
+    <div class="logo">&#x1F6E1; SENTINEL <span id="offline-badge" class="badge offline" style="display:none">OFFLINE MODE</span></div>
     <div class="sub">Local AI Phishing Intelligence</div>
   </div>
 </header>
@@ -587,7 +659,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   <!-- ── Results Panel ── -->
   <div class="panel">
-    <h2>Results</h2>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:1rem">
+      <div>
+        <h2 style="margin-bottom:.2rem">Results</h2>
+        <div id="analysis-ts" style="font-size:0.75rem;color:#64748b;display:none"></div>
+      </div>
+      <button id="download-btn" class="btn-download" onclick="downloadJSON()" style="display:none">&#x2B07; Download JSON</button>
+    </div>
 
     <div class="summary-cards">
       <div class="s-card">
@@ -673,9 +751,12 @@ function startAnalysis() {
   const btn     = document.getElementById('start-btn');
 
   btn.disabled = true;
-  document.getElementById('progress-wrap').style.display = 'block';
-  document.getElementById('status-text').textContent     = 'Starting\u2026';
-  document.getElementById('progress-fill').style.width   = '0%';
+  document.getElementById('progress-wrap').style.display  = 'block';
+  document.getElementById('status-text').textContent      = 'Starting\u2026';
+  document.getElementById('progress-fill').style.width    = '0%';
+  document.getElementById('offline-badge').style.display  = offline ? 'inline-block' : 'none';
+  document.getElementById('download-btn').style.display   = 'none';
+  document.getElementById('analysis-ts').style.display    = 'none';
 
   fetch('/analyze', {
     method:  'POST',
@@ -728,6 +809,20 @@ function loadResults() {
       allResults = data;
       renderCards(data);
       renderTable(data);
+
+      // Show completion timestamp
+      const now  = new Date();
+      const ts   = String(now.getHours()).padStart(2,'0') + ':' +
+                   String(now.getMinutes()).padStart(2,'0') + ':' +
+                   String(now.getSeconds()).padStart(2,'0');
+      const tsEl = document.getElementById('analysis-ts');
+      tsEl.textContent = 'Analysis completed at ' + ts;
+      tsEl.style.display = 'block';
+
+      // Show download button when there is at least one result
+      if (data.length) {
+        document.getElementById('download-btn').style.display = 'inline-block';
+      }
     })
     .catch(e => alert('Failed to load results: ' + e));
 }
@@ -746,7 +841,16 @@ function renderTable(data) {
     return;
   }
   tbody.innerHTML = '';
+
+  // Split into normal and error buckets, preserving original indices for showModal
+  const normalIdx = [];
+  const errorIdx  = [];
   data.forEach(function(r, i) {
+    if (r.risk_level === 'ERROR') { errorIdx.push(i); } else { normalIdx.push(i); }
+  });
+
+  normalIdx.forEach(function(i) {
+    const r   = data[i];
     const lvl = (r.risk_level || 'unknown').toLowerCase();
     const tr  = document.createElement('tr');
     tr.innerHTML =
@@ -759,6 +863,69 @@ function renderTable(data) {
       '<td><button class="btn-sm" onclick="showModal(' + i + ')">View Report</button></td>';
     tbody.appendChild(tr);
   });
+
+  // Error section — shown only when at least one file failed
+  if (errorIdx.length) {
+    const hdr = document.createElement('tr');
+    hdr.className = 'error-group-row';
+    hdr.innerHTML = '<td colspan="7">Errors &mdash; ' + errorIdx.length +
+                    ' file' + (errorIdx.length !== 1 ? 's' : '') + '</td>';
+    tbody.appendChild(hdr);
+
+    errorIdx.forEach(function(i) {
+      const r  = data[i];
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td title="' + esc(r.filename) + '" style="color:#9ca3af">' + esc(truncate(r.filename, 32)) + '</td>' +
+        '<td><span class="badge error">ERROR</span></td>' +
+        '<td colspan="4" style="color:#6b7280;font-size:0.83rem">' + esc(r.error || 'Unknown error') + '</td>' +
+        '<td style="color:#475569">\u2014</td>';
+      tbody.appendChild(tr);
+    });
+  }
+}
+
+// ── JSON download (Blob API) ──
+// Builds the same structure as the --json CLI flag so the file is drop-in
+// compatible with SIEM importers that consume sentinel_results.json.
+function downloadJSON() {
+  const high   = allResults.filter(function(r) { return r.risk_level === 'HIGH';   });
+  const medium = allResults.filter(function(r) { return r.risk_level === 'MEDIUM'; });
+  const low    = allResults.filter(function(r) { return r.risk_level === 'LOW';    });
+  const errors = allResults.filter(function(r) { return r.risk_level === 'ERROR';  });
+
+  const now    = new Date();
+  const pad    = function(n) { return String(n).padStart(2, '0'); };
+  const exported_at =
+    now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + 'T' +
+    pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+
+  const payload = {
+    sentinel_version: '0.8',
+    exported_at:      exported_at,
+    total_analyzed:   allResults.length,
+    high_risk:        high.length,
+    medium_risk:      medium.length,
+    low_risk:         low.length,
+    errors:           errors.length,
+    offline_mode:     document.querySelector('input[name="mode"]:checked').value === 'offline',
+    emails: {
+      high_risk:   high,
+      medium_risk: medium,
+      low_risk:    low,
+      errors:      errors,
+    },
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = 'sentinel_results.json';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // ── Modal ──
